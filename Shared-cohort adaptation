@@ -1,0 +1,165 @@
+# Shared-cohort adaptation: new AE on FAULT Mamba embeddings + existing XGBoost evidence.
+# Does not reuse the independent anomaly dataset or require prebuilt Fusion_Input CSVs.
+# Existing validation data become fusion development data. Final test is not fitted on.
+from pathlib import Path
+import json,random,time
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import torch
+from torch import nn
+from torch.utils.data import DataLoader,TensorDataset
+from sklearn.model_selection import GroupShuffleSplit
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import make_pipeline
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (roc_auc_score,average_precision_score,precision_recall_curve,
+    roc_curve,accuracy_score,precision_score,recall_score,f1_score,brier_score_loss,
+    log_loss,confusion_matrix,ConfusionMatrixDisplay)
+import joblib
+from google.colab import drive
+
+BASE=Path('/content/drive/MyDrive/Port Work')
+FEATURE_DIR=None  # Set explicitly if more than one complete fault Features folder exists.
+FAULT_RESULTS=None  # Set explicitly if more than one saved prediction set exists.
+SEED=42;random.seed(SEED);np.random.seed(SEED);torch.manual_seed(SEED)
+if not Path('/content/drive/MyDrive').is_dir(): drive.mount('/content/drive',force_remount=False)
+if FEATURE_DIR is None:
+    roots=[BASE/'Fault_Mamba_XGBoost_21_Engineered',BASE/'Fault_Mamba_XGBoost_21_Engineered_Fast']
+    found=[p/'Features' for p in roots if all((p/'Features'/f'{s}_mamba_features.npz').is_file() for s in ['train','validation','test'])]
+    if len(found)!=1: raise ValueError('Set FEATURE_DIR to the completed fault Features folder. Found: '+str(found))
+    FEATURE_DIR=found[0]
+FEATURE_DIR=Path(FEATURE_DIR)
+if FAULT_RESULTS is None:
+    candidates=[FEATURE_DIR.parent/'XGBoost_Fault_Standalone',FEATURE_DIR.parent]
+    found=[p for p in candidates if all((p/f'{s}_fault_predictions.csv').is_file() for s in ['validation','test'])]
+    if not found: raise FileNotFoundError('Run XGBoost training first; no fault predictions found.')
+    # Prefer standalone XGBoost outputs when both exist.
+    FAULT_RESULTS=found[0]
+FAULT_RESULTS=Path(FAULT_RESULTS)
+OUT=FEATURE_DIR.parent/'Shared_Cohort_Fusion_Risk';OUT.mkdir(parents=True,exist_ok=True)
+print('Feature folder:',FEATURE_DIR,'\nFault predictions:',FAULT_RESULTS,flush=True)
+D={};seen=set();seen_eq=set();dim=None
+for split,counts in {'train':[13860,6350],'validation':[1973,622],'test':[3947,1245]}.items():
+    with np.load(FEATURE_DIR/f'{split}_mamba_features.npz',allow_pickle=False) as a:
+        h=a['H'].astype(np.float32);raw=a['y'];ids=a['window_id'].astype(str);eq=a['equipment_id'].astype(str)
+    if not np.isin(raw,[0,1]).all(): raise ValueError('Invalid fault labels')
+    y=raw.astype(int)
+    if h.ndim!=2 or len(h)!=len(y) or not np.isfinite(h).all() or np.bincount(y,minlength=2).tolist()!=counts: raise ValueError('Invalid feature matrix/counts')
+    if dim is None: dim=h.shape[1]
+    if h.shape[1]!=dim or len(ids)!=len(y) or len(eq)!=len(y) or len(set(ids))!=len(ids): raise ValueError('Dimension/ID mismatch')
+    if seen&set(ids) or seen_eq&set(eq): raise ValueError('Cross-split equipment/window leakage')
+    seen.update(ids);seen_eq.update(eq)
+    meta=pd.DataFrame({'window_id':ids,'equipment_id':eq})
+    if split!='train':
+        f=pd.read_csv(FAULT_RESULTS/f'{split}_fault_predictions.csv',dtype={'window_id':str,'equipment_id':str})
+        if f.window_id.duplicated().any() or set(f.window_id)!=set(ids): raise ValueError('Fault prediction IDs mismatch')
+        f=f.set_index('window_id').loc[ids].reset_index()
+        if not np.array_equal(f.equipment_id.to_numpy(),eq) or not np.array_equal(f.true_label.to_numpy(),y): raise ValueError('Fault prediction labels/equipment mismatch')
+        p=f.fault_probability_estimate.to_numpy(dtype=float)
+        if not np.isfinite(p).all() or np.any((p<0)|(p>1)): raise ValueError('Invalid fault probability')
+        for col in ['window_start','window_end']:
+            if col in f: meta[col]=f[col].to_numpy()
+    else: p=None
+    D[split]={'H':h,'y':y,'meta':meta,'p':p}
+    print('Loaded',split,h.shape,flush=True)
+
+# Train the NEW shared-cohort anomaly head on normal fault-training embeddings.
+normal_indices=np.flatnonzero(D['train']['y']==0)
+normal_groups=D['train']['meta'].equipment_id.to_numpy()[normal_indices]
+a,b=next(GroupShuffleSplit(n_splits=1,test_size=.2,random_state=SEED).split(normal_indices,groups=normal_groups))
+fit_idx=normal_indices[a];stop_idx=normal_indices[b]
+scaler=StandardScaler().fit(D['train']['H'][fit_idx])
+joblib.dump(scaler,OUT/'anomaly_embedding_scaler.joblib')
+zfit=scaler.transform(D['train']['H'][fit_idx]).astype(np.float32)
+zstop=scaler.transform(D['train']['H'][stop_idx]).astype(np.float32)
+class AE(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net=nn.Sequential(nn.Linear(dim,64),nn.ReLU(),nn.Linear(64,32),nn.ReLU(),nn.Linear(32,16),nn.Linear(16,32),nn.ReLU(),nn.Linear(32,64),nn.ReLU(),nn.Linear(64,dim))
+    def forward(self,x): return self.net(x)
+device=torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+model=AE().to(device);optimizer=torch.optim.Adam(model.parameters(),lr=.001)
+fit=DataLoader(TensorDataset(torch.from_numpy(zfit)),batch_size=128,shuffle=True)
+stop=DataLoader(TensorDataset(torch.from_numpy(zstop)),batch_size=128)
+best=float('inf');stale=0;history=[]
+for epoch in range(1,51):
+    losses=[]
+    for training,batches in [(True,fit),(False,stop)]:
+        model.train(training);total=0.;n=0
+        for (batch,) in batches:
+            batch=batch.to(device)
+            with torch.set_grad_enabled(training):
+                loss=((model(batch)-batch)**2).mean()
+                if not torch.isfinite(loss): raise ValueError('Nonfinite AE loss')
+                if training:
+                    optimizer.zero_grad(set_to_none=True);loss.backward();optimizer.step()
+            total+=loss.item()*len(batch);n+=len(batch)
+        losses.append(total/n)
+    history.append({'epoch':epoch,'train_mse':losses[0],'normal_training_holdout_mse':losses[1]})
+    print(f'Shared AE epoch {epoch}: train={losses[0]:.6f}, holdout={losses[1]:.6f}',flush=True)
+    if losses[1]<best:
+        best=losses[1];stale=0;torch.save(model.state_dict(),OUT/'shared_autoencoder.pt')
+    else:
+        stale+=1
+        if stale>=7: break
+pd.DataFrame(history).to_csv(OUT/'shared_ae_history.csv',index=False)
+model.load_state_dict(torch.load(OUT/'shared_autoencoder.pt',map_location=device,weights_only=True));model.eval()
+def score(h):
+    z=scaler.transform(h).astype(np.float32);parts=[]
+    with torch.no_grad():
+        for i in range(0,len(z),256):
+            x=torch.from_numpy(z[i:i+256]).to(device);parts.append(((model(x)-x)**2).mean(1).cpu().numpy())
+    s=np.concatenate(parts)
+    if not np.isfinite(s).all(): raise ValueError('Nonfinite anomaly scores')
+    return s
+reference=np.sort(score(D['train']['H'][stop_idx]))
+def evidence(item):
+    mse=score(item['H']);a=np.searchsorted(reference,mse,side='right')/len(reference)
+    p=item['p'];return np.column_stack([a,p,a*p]),mse
+# Both scores now concern the SAME fault embedding rows; no unrelated IDs are joined.
+v=D['validation'];V,vmse=evidence(v)
+fit_v,tune_v=next(GroupShuffleSplit(n_splits=1,test_size=.5,random_state=SEED).split(V,groups=v['meta'].equipment_id))
+if len(np.unique(v['y'][fit_v]))<2 or len(np.unique(v['y'][tune_v]))<2: raise ValueError('Both fusion-development partitions need both fault classes')
+fusion=make_pipeline(StandardScaler(),LogisticRegression(max_iter=2000,random_state=SEED))
+fusion.fit(V[fit_v],v['y'][fit_v])
+pt=fusion.predict_proba(V[tune_v])[:,1]
+p,r,t=precision_recall_curve(v['y'][tune_v],pt);f=2*p[:-1]*r[:-1]/np.maximum(p[:-1]+r[:-1],1e-12)
+threshold=float(t[int(np.argmax(f))])
+joblib.dump({'fusion':fusion,'normal_reference_mse':reference,'threshold':threshold,'input_order':['normal_reference_percentile','fault_probability','interaction']},OUT/'fusion_model.joblib')
+for role,idx in [('fusion_fit',fit_v),('threshold_tuning',tune_v)]:
+    v['meta'].iloc[idx].to_csv(OUT/f'{role}_manifest.csv',index=False)
+results={}
+for split in ['validation','test']:
+    item=D[split]
+    X,mse=(V,vmse) if split=='validation' else evidence(item)
+    prob=fusion.predict_proba(X)[:,1];pred=(prob>=threshold).astype(int);y=item['y']
+    levels=np.array(['Low','Moderate','High','Critical'])[np.digitize(prob,[.25,.5,.75])]
+    frame=item['meta'].copy();frame['true_fault']=y;frame['anomaly_score_mse']=mse
+    frame['fault_probability_estimate']=item['p'];frame['fused_fault_probability_estimate']=prob
+    frame['predicted_fault']=pred;frame['risk_level']=levels;frame['is_synthetic']=True
+    if split=='validation':
+        roles=np.full(len(y),'threshold_tuning',dtype=object);roles[fit_v]='fusion_fit';frame['development_role']=roles
+    frame.to_csv(OUT/f'{split}_risk_predictions.csv',index=False)
+    # Only test is final evaluation; validation was used for fitting/tuning.
+    if split=='test':
+        metrics={'accuracy':float(accuracy_score(y,pred)),'precision':float(precision_score(y,pred,zero_division=0)),
+            'recall':float(recall_score(y,pred,zero_division=0)),'f1':float(f1_score(y,pred,zero_division=0)),
+            'roc_auc':float(roc_auc_score(y,prob)),'average_precision':float(average_precision_score(y,prob)),
+            'brier_score':float(brier_score_loss(y,prob)),'log_loss':float(log_loss(y,prob)),
+            'confusion_matrix':confusion_matrix(y,pred,labels=[0,1]).tolist()}
+        yp=y;pp=prob;pd_=pred
+(OUT/'test_metrics.json').write_text(json.dumps(metrics,indent=2))
+(OUT/'method_notes.json').write_text(json.dumps({'synthetic':True,'adaptation':'new Autoencoder on normal fault Mamba embeddings; independent original anomaly branch not reused',
+    'fusion_training':'half of existing validation equipment; other half chooses threshold',
+    'limitation':'existing validation may already have guided upstream model selection; this is not an independent calibration experiment',
+    'test':'no fitting/tuning performed here on test','risk_bands':'proposed .25/.50/.75 bands, not verified four-class labels',
+    'probabilities':'estimates; no guarantee of calibration','anomaly_reference':'normal fault-training holdout MSE percentile, not anomaly probability'},indent=2))
+fig,axes=plt.subplots(1,2,figsize=(11,4.5))
+ConfusionMatrixDisplay.from_predictions(yp,pd_,labels=[0,1],display_labels=['Normal','Faulty'],ax=axes[0],cmap='Blues',colorbar=False)
+axes[0].set_title('Shared-cohort fused fault decisions')
+fpr,tpr,_=roc_curve(yp,pp);axes[1].plot(fpr,tpr,label=f"AUC={metrics['roc_auc']:.4f}")
+axes[1].plot([0,1],[0,1],'--',color='gray');axes[1].legend();axes[1].set(xlabel='False positive rate',ylabel='True positive rate',title='Test ROC')
+fig.suptitle('Shared-cohort adaptation — synthetic data');fig.tight_layout();fig.savefig(OUT/'fusion_test.png',dpi=200);plt.show();plt.close(fig)
+print(json.dumps(metrics,indent=2));print('Completed:',OUT,flush=True)
+print('Four risk levels are policy bands, not independently validated severity outcomes.')
