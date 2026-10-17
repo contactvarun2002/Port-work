@@ -1,0 +1,134 @@
+# Colab: visualize and explain the completed Shared_Cohort_Fusion_Risk model.
+# Exact linear-logit decomposition of the saved sigmoid fusion layer; not sensor-level SHAP.
+from pathlib import Path
+import json
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import joblib
+from google.colab import drive
+
+BASE=Path('/content/drive/MyDrive/Port Work')
+RESULT_DIR=None  # Set explicitly if both standard and fast fusion runs exist.
+RISK_ORDER=['Low','Moderate','High','Critical']
+COLORS=['#299c62','#e4ba36','#ee8c37','#c94242']
+if not Path('/content/drive/MyDrive').is_dir(): drive.mount('/content/drive',force_remount=False)
+if RESULT_DIR is None:
+    candidates=[BASE/name/'Shared_Cohort_Fusion_Risk' for name in [
+        'Fault_Mamba_XGBoost_21_Engineered','Fault_Mamba_XGBoost_21_Engineered_Fast']]
+    complete=[p for p in candidates if (p/'test_risk_predictions.csv').is_file() and (p/'fusion_model.joblib').is_file()]
+    if len(complete)!=1: raise ValueError('Set RESULT_DIR to your completed fusion folder. Found: '+str(complete))
+    RESULT_DIR=complete[0]
+RESULT_DIR=Path(RESULT_DIR);OUT=RESULT_DIR/'Risk_Visualization_Explainability'
+OUT.mkdir(parents=True,exist_ok=True)
+print('Reading:',RESULT_DIR,flush=True)
+df=pd.read_csv(RESULT_DIR/'test_risk_predictions.csv',dtype={'window_id':str,'equipment_id':str})
+required=['window_id','equipment_id','anomaly_score_mse','fault_probability_estimate','fused_fault_probability_estimate','risk_level']
+if not set(required).issubset(df): raise ValueError('Missing columns: '+str(set(required)-set(df.columns)))
+if df[required].isna().any().any() or df.window_id.duplicated().any() or len(df)==0: raise ValueError('Missing or duplicate data')
+for col in ['anomaly_score_mse','fault_probability_estimate','fused_fault_probability_estimate']:
+    df[col]=pd.to_numeric(df[col],errors='raise')
+    if not np.isfinite(df[col]).all(): raise ValueError('Nonfinite '+col)
+if (df.anomaly_score_mse<0).any(): raise ValueError('Negative MSE')
+for col in ['fault_probability_estimate','fused_fault_probability_estimate']:
+    if not df[col].between(0,1).all(): raise ValueError('Probability outside [0,1]')
+expected=np.array(RISK_ORDER)[np.digitize(df.fused_fault_probability_estimate.to_numpy(),[.25,.5,.75])]
+if not np.array_equal(expected,df.risk_level.to_numpy()): raise ValueError('Risk labels disagree with the original .25/.50/.75 band policy')
+
+def save_show(fig,name):
+    fig.tight_layout();fig.savefig(OUT/name,dpi=200,bbox_inches='tight');plt.show();plt.close(fig)
+
+# 1. Risk distribution.
+counts=df.risk_level.value_counts().reindex(RISK_ORDER,fill_value=0)
+summary=pd.DataFrame({'risk_level':RISK_ORDER,'windows':counts.values,'percentage':100*counts.values/len(df)})
+summary.to_csv(OUT/'risk_distribution.csv',index=False)
+fig,ax=plt.subplots(figsize=(7,4));bars=ax.bar(RISK_ORDER,counts.values,color=COLORS)
+ax.bar_label(bars,padding=3);ax.set(xlabel='Proposed risk band',ylabel='Windows',title='Test risk distribution — synthetic data')
+save_show(fig,'risk_distribution.png')
+
+# 2. Equipment summaries use all windows; maximum score is descriptive, not a policy.
+equipment=df.groupby('equipment_id').agg(windows=('window_id','size'),mean_risk_score=('fused_fault_probability_estimate','mean'),max_risk_score=('fused_fault_probability_estimate','max'))
+by_band=pd.crosstab(df.equipment_id,df.risk_level).reindex(columns=RISK_ORDER,fill_value=0)
+equipment=equipment.join(by_band).fillna(0)
+equipment['high_or_critical_fraction']=(equipment['High']+equipment['Critical'])/equipment.windows
+equipment=equipment.sort_values(['high_or_critical_fraction','max_risk_score'],ascending=False)
+equipment.to_csv(OUT/'equipment_risk_summary.csv')
+top=equipment.head(20)
+fig,ax=plt.subplots(figsize=(10,6))
+top[RISK_ORDER].iloc[::-1].plot.barh(stacked=True,color=COLORS,ax=ax)
+ax.set(xlabel='Windows',ylabel='Equipment ID',title='Equipment risk-band counts — up to 20 machines');ax.legend(title='Risk band')
+save_show(fig,'equipment_risk_counts.png')
+alerts=df.loc[df.risk_level.isin(['High','Critical'])].sort_values('fused_fault_probability_estimate',ascending=False)
+alerts.to_csv(OUT/'high_critical_windows_for_review.csv',index=False)
+
+# 3. Risk over time, per machine. Do not connect different equipment into one time series.
+if 'window_start' in df:
+    df['parsed_time']=pd.to_datetime(df.window_start,utc=True,errors='raise')
+    chosen=equipment.index[0]
+    trend=df.loc[df.equipment_id.eq(chosen)].sort_values('parsed_time')
+    fig,ax=plt.subplots(figsize=(11,4));ax.plot(trend.parsed_time,trend.fused_fault_probability_estimate,lw=1.2)
+    for threshold in [.25,.5,.75]: ax.axhline(threshold,color='gray',ls='--',lw=.8)
+    ax.set(xlabel='Window start (UTC)',ylabel='Fused fault-score estimate',ylim=(0,1),title=f'Risk trend: {chosen} — synthetic windows')
+    fig.autofmt_xdate();save_show(fig,'equipment_risk_trend.png')
+else:
+    print('Timestamp column absent: time-trend plot skipped.',flush=True)
+
+# 4. Exact fusion explanation. Load only your own trusted joblib model.
+bundle=joblib.load(RESULT_DIR/'fusion_model.joblib')
+fusion=bundle['fusion'];reference=np.asarray(bundle['normal_reference_mse'])
+if reference.ndim!=1 or len(reference)==0 or not np.isfinite(reference).all() or np.any(np.diff(reference)<0): raise ValueError('Invalid normal-score reference')
+a=np.searchsorted(reference,df.anomaly_score_mse.to_numpy(),side='right')/len(reference)
+p=df.fault_probability_estimate.to_numpy()
+X=np.column_stack([a,p,a*p])
+names=['Anomaly evidence percentile','XGBoost fault estimate','Interaction']
+if bundle.get('input_order')!=['normal_reference_percentile','fault_probability','interaction']: raise ValueError('Unexpected fusion input order')
+scale=fusion.named_steps['standardscaler'];linear=fusion.named_steps['logisticregression']
+Z=scale.transform(X)
+contributions=Z*linear.coef_[0]
+intercept=float(linear.intercept_[0])
+logits=intercept+contributions.sum(axis=1)
+from scipy.special import expit
+reconstructed=expit(logits)
+model_p=fusion.predict_proba(X)[:,1]
+np.testing.assert_allclose(reconstructed,model_p,rtol=1e-7,atol=1e-8)
+np.testing.assert_allclose(model_p,df.fused_fault_probability_estimate.to_numpy(),rtol=1e-4,atol=1e-6,
+    err_msg='Saved predictions do not match this model. Use the model from the same completed run.')
+
+# Positive terms raise log-odds relative to the standardized-zero reference; negative lower them.
+explanations=df[['window_id','equipment_id','risk_level']].copy()
+explanations['anomaly_reference_percentile']=a
+for j,label in enumerate(['anomaly','fault','interaction']):
+    explanations[label+'_logit_contribution']=contributions[:,j]
+explanations['intercept_logit']=intercept
+explanations['reconstructed_fused_probability']=reconstructed
+explanations.to_csv(OUT/'window_fusion_explanations.csv',index=False)
+importance=np.abs(contributions).mean(axis=0)
+importance_table=pd.DataFrame({'fusion_input':names,'mean_absolute_logit_contribution':importance})
+importance_table.to_csv(OUT/'global_fusion_contribution.csv',index=False)
+fig,ax=plt.subplots(figsize=(8,4));order=np.argsort(importance)
+ax.barh(np.array(names)[order],importance[order],color='#426b9c')
+ax.set(xlabel='Mean absolute contribution to log-odds',title='Global fusion contributions — test windows')
+save_show(fig,'global_fusion_contributions.png')
+
+# Explain the highest-scoring test window without changing its prediction.
+i=int(np.argmax(model_p));values=np.r_[intercept,contributions[i]]
+labels=['Intercept']+names
+fig,ax=plt.subplots(figsize=(9,4))
+ax.barh(labels[::-1],values[::-1],color=['#c94242' if v>0 else '#397eb2' for v in values[::-1]])
+ax.axvline(0,color='black',lw=.8)
+ax.set(xlabel='Additive log-odds contribution',title=f"Window {df.iloc[i].window_id}: fused score {model_p[i]:.3f}")
+save_show(fig,'highest_score_local_explanation.png')
+notes={'data_origin':'synthetic','risk_bands':'proposed thresholds, not independent ground-truth severity classes',
+    'explanation':'exact standardized linear-logit decomposition of the learned sigmoid fusion model',
+    'identity':'sigmoid(intercept + anomaly contribution + fault contribution + interaction contribution)',
+    'units':'log-odds; these contributions do not add directly as probabilities',
+    'reference':'zero standardized inputs; NOT a SHAP expected-value reference',
+    'limits':'predictive association, not causal effect; not sensor-level feature importance; interaction depends on both branch inputs',
+    'equipment_summary':'counts/mean/max describe observed windows; no machine-level failure probability is asserted',
+    'highest_score_window_id':str(df.iloc[i].window_id)}
+(OUT/'explanation_notes.json').write_text(json.dumps(notes,indent=2))
+print('\nRisk distribution:');print(summary.to_string(index=False))
+print('\nHighest-priority equipment summaries:');print(equipment.head(10).to_string())
+print('\nHigh/critical windows:',len(alerts),'of',len(df))
+print('Exact explanation reconstruction verified.')
+print('Completed. Saved to:',OUT,flush=True)
