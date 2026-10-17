@@ -1,0 +1,620 @@
+# ============================================================
+# ANOMALY DATASET PREPROCESSING — COMPLETE COLAB CODE
+#
+# Input:
+# /content/drive/MyDrive/Port Work/Synthetic_Anomaly_Dataset
+#
+# Expected package structure:
+#   anomaly/
+#       train_labels.csv
+#       validation_labels.csv
+#       test_labels.csv
+#   sequences/
+#       train_sequences.npz
+#       validation_sequences.npz
+#       test_sequences.npz
+#
+# Output:
+# /content/drive/MyDrive/Port Work/Anomaly_Preprocessed
+#
+# Data is SYNTHETIC. Counts refer to 100-step sensor windows.
+# ============================================================
+
+from pathlib import Path
+from itertools import combinations
+import hashlib
+import json
+
+import numpy as np
+import pandas as pd
+
+from google.colab import drive
+
+
+# ============================================================
+# 1. CONFIGURATION
+# ============================================================
+
+INPUT_ROOT = Path(
+    "/content/drive/MyDrive/Port Work/Synthetic_Anomaly_Dataset"
+)
+
+OUTPUT_ROOT = Path(
+    "/content/drive/MyDrive/Port Work/Anomaly_Preprocessed"
+)
+
+EXPECTED_COUNTS = {
+    "train":      {0: 13000, 1: 1000},
+    "validation": {0: 2785,  1: 215},
+    "test":       {0: 2785,  1: 215},
+}
+
+FEATURES = [
+    "pressure_bar",
+    "temperature_c",
+    "vibration_mm_s",
+    "speed_kmh",
+    "torque_nm",
+    "inclination_deg",
+    "acceleration_m_s2",
+    "ambient_temperature_c",
+]
+
+TIME_STEPS = 100
+SAMPLING_INTERVAL_SECONDS = 0.1
+
+# No smoothing or clipping: preserve potential anomaly spikes.
+
+
+# ============================================================
+# 2. CONNECT GOOGLE DRIVE
+# ============================================================
+
+if not Path("/content/drive/MyDrive").is_dir():
+    drive.mount("/content/drive", force_remount=False)
+
+if not INPUT_ROOT.is_dir():
+    raise FileNotFoundError(
+        f"Input folder does not exist:\n{INPUT_ROOT}\n"
+        "Extract Synthetic_Anomaly_Dataset.zip into this folder."
+    )
+
+
+# ============================================================
+# 3. LOCATE THE EXTRACTED DATASET
+# Handles one or more extra nesting folders.
+# ============================================================
+
+def is_dataset_folder(folder):
+    return all(
+        (folder / "anomaly" / f"{split}_labels.csv").is_file()
+        and
+        (folder / "sequences" / f"{split}_sequences.npz").is_file()
+        for split in EXPECTED_COUNTS
+    )
+
+
+if is_dataset_folder(INPUT_ROOT):
+    DATA_ROOT = INPUT_ROOT
+else:
+    candidates = []
+
+    for label_file in INPUT_ROOT.rglob("train_labels.csv"):
+        if label_file.parent.name == "anomaly":
+            candidate = label_file.parent.parent
+
+            if is_dataset_folder(candidate):
+                candidates.append(candidate)
+
+    candidates = list(dict.fromkeys(candidates))
+
+    if len(candidates) != 1:
+        raise FileNotFoundError(
+            "Could not identify exactly one complete anomaly dataset.\n"
+            "The folder must contain anomaly/*.csv and sequences/*.npz.\n"
+            f"Complete datasets found: {len(candidates)}"
+        )
+
+    DATA_ROOT = candidates[0]
+
+print("Dataset folder:", DATA_ROOT)
+
+
+# ============================================================
+# 4. LOAD AND VALIDATE LABELS AND SENSOR SEQUENCES
+# ============================================================
+
+datasets = {}
+equipment_sets = {}
+window_sets = {}
+sequence_hash_sets = {}
+
+report = {
+    "data_origin": "synthetic demonstration",
+    "input_folder": str(DATA_ROOT),
+    "feature_names": FEATURES,
+    "window_length": TIME_STEPS,
+    "sampling_interval_seconds": SAMPLING_INTERVAL_SECONDS,
+    "preprocessing_fit_subset": "normal training windows only",
+    "smoothing": "disabled",
+    "splits": {},
+}
+
+for split, expected in EXPECTED_COUNTS.items():
+
+    labels_path = DATA_ROOT / "anomaly" / f"{split}_labels.csv"
+    sequences_path = DATA_ROOT / "sequences" / f"{split}_sequences.npz"
+
+    labels = pd.read_csv(
+        labels_path,
+        dtype={
+            "window_id": str,
+            "equipment_id": str,
+        },
+    )
+
+    required_columns = [
+        "window_id",
+        "equipment_id",
+        "window_start",
+        "window_end",
+        "split",
+        "is_synthetic",
+        "label",
+        "class_name",
+    ]
+
+    missing_columns = [
+        column
+        for column in required_columns
+        if column not in labels.columns
+    ]
+
+    if missing_columns:
+        raise ValueError(
+            f"{split}: missing columns: {missing_columns}"
+        )
+
+    if labels[required_columns].isna().any().any():
+        raise ValueError(
+            f"{split}: missing identifiers, timestamps, or labels."
+        )
+
+    if labels["window_id"].duplicated().any():
+        raise ValueError(
+            f"{split}: duplicate window IDs detected."
+        )
+
+    if not labels["split"].eq(split).all():
+        raise ValueError(
+            f"{split}: incorrect split values in label CSV."
+        )
+
+    synthetic_flags = (
+        labels["is_synthetic"]
+        .astype(str)
+        .str.strip()
+        .str.lower()
+    )
+
+    if not synthetic_flags.eq("true").all():
+        raise ValueError(
+            f"{split}: expected synthetic dataset provenance."
+        )
+
+    numeric_labels = pd.to_numeric(
+        labels["label"],
+        errors="raise",
+    )
+
+    if not numeric_labels.isin([0, 1]).all():
+        raise ValueError(
+            f"{split}: labels must be 0=Normal or 1=Anomalous."
+        )
+
+    labels["label"] = numeric_labels.astype(np.int64)
+
+    with np.load(
+        sequences_path,
+        allow_pickle=False,
+    ) as stored:
+
+        required_arrays = {
+            "X",
+            "window_id",
+            "equipment_id",
+            "feature_names",
+        }
+
+        if not required_arrays.issubset(stored.files):
+            raise ValueError(
+                f"{split}: NPZ is missing required arrays."
+            )
+
+        X = stored["X"].astype(np.float32)
+        sequence_ids = stored["window_id"].astype(str)
+        sequence_equipment = stored["equipment_id"].astype(str)
+        feature_names = stored["feature_names"].astype(str).tolist()
+
+    expected_rows = sum(expected.values())
+
+    if X.shape != (expected_rows, TIME_STEPS, len(FEATURES)):
+        raise ValueError(
+            f"{split}: unexpected X shape {X.shape}.\n"
+            f"Expected {(expected_rows, TIME_STEPS, len(FEATURES))}"
+        )
+
+    if feature_names != FEATURES:
+        raise ValueError(
+            f"{split}: sensor names or ordering differ.\n"
+            f"Found: {feature_names}"
+        )
+
+    if (
+        len(sequence_ids) != len(X)
+        or len(sequence_equipment) != len(X)
+    ):
+        raise ValueError(
+            f"{split}: sequence identifiers have incorrect lengths."
+        )
+
+    if len(set(sequence_ids)) != len(sequence_ids):
+        raise ValueError(
+            f"{split}: duplicate IDs in sequence arrays."
+        )
+
+    if set(sequence_ids) != set(labels["window_id"]):
+        raise ValueError(
+            f"{split}: sequence IDs do not match label IDs."
+        )
+
+    # Align CSV rows to NPZ sequence ordering using identifiers.
+    labels = (
+        labels
+        .set_index("window_id")
+        .loc[sequence_ids]
+        .reset_index()
+    )
+
+    if not np.array_equal(
+        sequence_equipment,
+        labels["equipment_id"].to_numpy(),
+    ):
+        raise ValueError(
+            f"{split}: equipment IDs disagree between CSV and NPZ."
+        )
+
+    y = labels["label"].to_numpy(dtype=np.int64)
+
+    actual_counts = {
+        0: int(np.sum(y == 0)),
+        1: int(np.sum(y == 1)),
+    }
+
+    if actual_counts != expected:
+        raise ValueError(
+            f"{split}: class counts differ.\n"
+            f"Expected: {expected}\n"
+            f"Found: {actual_counts}"
+        )
+
+    expected_names = np.where(
+        y == 0,
+        "Normal",
+        "Anomalous",
+    )
+
+    if not np.array_equal(
+        labels["class_name"].to_numpy(),
+        expected_names,
+    ):
+        raise ValueError(
+            f"{split}: class names disagree with numeric labels."
+        )
+
+    starts = pd.to_datetime(
+        labels["window_start"],
+        utc=True,
+        errors="raise",
+    )
+
+    ends = pd.to_datetime(
+        labels["window_end"],
+        utc=True,
+        errors="raise",
+    )
+
+    expected_duration = (
+        TIME_STEPS - 1
+    ) * SAMPLING_INTERVAL_SECONDS
+
+    durations = (ends - starts).dt.total_seconds()
+
+    if not np.allclose(durations, expected_duration):
+        raise ValueError(
+            f"{split}: unexpected window timestamp duration."
+        )
+
+    # Verify non-overlapping windows within each machine.
+    time_table = pd.DataFrame({
+        "equipment_id": sequence_equipment,
+        "start": starts,
+        "end": ends,
+    })
+
+    for equipment_id, group in time_table.groupby("equipment_id"):
+
+        group = group.sort_values("start")
+
+        later_starts = group["start"].iloc[1:].to_numpy()
+        earlier_ends = group["end"].iloc[:-1].to_numpy()
+
+        if np.any(later_starts <= earlier_ends):
+            raise ValueError(
+                f"{split}: overlapping windows for {equipment_id}."
+            )
+
+    # Detect exact repeated complete windows.
+    # Repeated scalar sensor values are allowed.
+    hashes = [
+        hashlib.sha256(
+            np.ascontiguousarray(window).tobytes()
+        ).hexdigest()
+        for window in X
+    ]
+
+    if len(set(hashes)) != len(hashes):
+        raise ValueError(
+            f"{split}: duplicate complete sensor windows found. "
+            "Investigate them before changing dataset counts."
+        )
+
+    invalid_mask = ~np.isfinite(X)
+    invalid_count = int(invalid_mask.sum())
+
+    # Convert NaN and infinity to one missing-value representation.
+    X[invalid_mask] = np.nan
+
+    datasets[split] = {
+        "X": X,
+        "y": y,
+        "manifest": labels,
+    }
+
+    equipment_sets[split] = set(sequence_equipment)
+    window_sets[split] = set(sequence_ids)
+    sequence_hash_sets[split] = set(hashes)
+
+    report["splits"][split] = {
+        "input_shape": list(X.shape),
+        "normal": actual_counts[0],
+        "anomalous": actual_counts[1],
+        "equipment_count": len(equipment_sets[split]),
+        "missing_or_infinite_values": invalid_count,
+    }
+
+    print(
+        f"{split}: {X.shape} | "
+        f"Normal={actual_counts[0]} | "
+        f"Anomalous={actual_counts[1]}"
+    )
+
+
+# ============================================================
+# 5. CHECK FOR LEAKAGE BETWEEN SPLITS
+# ============================================================
+
+for first, second in combinations(EXPECTED_COUNTS, 2):
+
+    if equipment_sets[first] & equipment_sets[second]:
+        raise ValueError(
+            f"Equipment overlap between {first} and {second}."
+        )
+
+    if window_sets[first] & window_sets[second]:
+        raise ValueError(
+            f"Window-ID overlap between {first} and {second}."
+        )
+
+    if sequence_hash_sets[first] & sequence_hash_sets[second]:
+        raise ValueError(
+            f"Identical sensor sequences appear in "
+            f"{first} and {second}."
+        )
+
+print("Passed equipment, window, and duplicate leakage checks.")
+
+
+# ============================================================
+# 6. FIT IMPUTATION ON NORMAL TRAINING DATA ONLY
+# ============================================================
+
+train_X = datasets["train"]["X"]
+train_y = datasets["train"]["y"]
+
+normal_training = train_X[train_y == 0].reshape(
+    -1,
+    len(FEATURES),
+)
+
+valid_per_feature = np.sum(
+    np.isfinite(normal_training),
+    axis=0,
+)
+
+if np.any(valid_per_feature == 0):
+
+    unavailable = [
+        FEATURES[index]
+        for index in np.flatnonzero(valid_per_feature == 0)
+    ]
+
+    raise ValueError(
+        "No valid normal-training measurements for: "
+        f"{unavailable}"
+    )
+
+imputation_mean = np.nanmean(
+    normal_training,
+    axis=0,
+    dtype=np.float64,
+)
+
+normal_training_imputed = np.where(
+    np.isnan(normal_training),
+    imputation_mean,
+    normal_training,
+)
+
+
+# ============================================================
+# 7. FIT STANDARDIZATION ON NORMAL TRAINING DATA ONLY
+# ============================================================
+
+scaler_mean = normal_training_imputed.mean(
+    axis=0,
+    dtype=np.float64,
+)
+
+scaler_std = normal_training_imputed.std(
+    axis=0,
+    dtype=np.float64,
+)
+
+constant_features = scaler_std < 1e-12
+
+# Avoid division by zero for constant channels.
+scaler_std[constant_features] = 1.0
+
+OUTPUT_ROOT.mkdir(
+    parents=True,
+    exist_ok=True,
+)
+
+np.savez(
+    OUTPUT_ROOT / "preprocessing_parameters.npz",
+    imputation_mean=imputation_mean,
+    scaler_mean=scaler_mean,
+    scaler_std=scaler_std,
+    feature_names=np.asarray(FEATURES),
+)
+
+report["constant_features"] = [
+    FEATURES[index]
+    for index in np.flatnonzero(constant_features)
+]
+
+
+# ============================================================
+# 8. TRANSFORM AND SAVE ALL SPLITS
+# ============================================================
+
+for split, data in datasets.items():
+
+    X = data["X"]
+    y = data["y"]
+    manifest = data["manifest"]
+
+    X_imputed = np.where(
+        np.isnan(X),
+        imputation_mean,
+        X,
+    )
+
+    X_scaled = (
+        (X_imputed - scaler_mean) / scaler_std
+    ).astype(np.float32)
+
+    if not np.isfinite(X_scaled).all():
+        raise ValueError(
+            f"{split}: non-finite values remain after preprocessing."
+        )
+
+    window_ids = manifest["window_id"].to_numpy(dtype=str)
+    equipment_ids = manifest["equipment_id"].to_numpy(dtype=str)
+
+    np.savez_compressed(
+        OUTPUT_ROOT / f"{split}_mamba.npz",
+        X=X_scaled,
+        y=y,
+        window_id=window_ids,
+        equipment_id=equipment_ids,
+        feature_names=np.asarray(FEATURES),
+    )
+
+    manifest.to_csv(
+        OUTPUT_ROOT / f"{split}_manifest.csv",
+        index=False,
+    )
+
+    if split == "train":
+
+        normal_mask = y == 0
+
+        np.savez_compressed(
+            OUTPUT_ROOT / "train_normal_autoencoder.npz",
+            X=X_scaled[normal_mask],
+            window_id=window_ids[normal_mask],
+            equipment_id=equipment_ids[normal_mask],
+            feature_names=np.asarray(FEATURES),
+        )
+
+    report["splits"][split]["output_shape"] = list(
+        X_scaled.shape
+    )
+
+    print(f"Saved {split}_mamba.npz: {X_scaled.shape}")
+
+
+# ============================================================
+# 9. SAVE REPORT AND FEATURE STATISTICS
+# ============================================================
+
+statistics = pd.DataFrame({
+    "feature": FEATURES,
+    "imputation_mean": imputation_mean,
+    "scaler_mean": scaler_mean,
+    "scaler_std": scaler_std,
+    "constant_in_normal_training": constant_features,
+})
+
+statistics.to_csv(
+    OUTPUT_ROOT / "training_preprocessing_statistics.csv",
+    index=False,
+)
+
+with open(
+    OUTPUT_ROOT / "preprocessing_report.json",
+    "w",
+    encoding="utf-8",
+) as file:
+    json.dump(
+        report,
+        file,
+        indent=2,
+    )
+
+print("\nPREPROCESSING COMPLETED")
+print("Output folder:", OUTPUT_ROOT)
+print("Labels: 0 = Normal, 1 = Anomalous")
+print("Mamba input layout: batch, time steps, sensor features")
+print("Data origin: SYNTHETIC")
+print("Next stage: Mamba temporal representation learning.") 
+
+
+
+Dataset folder: /content/drive/MyDrive/Port Work/Synthetic_Anomaly_Dataset
+train: (14000, 100, 8) | Normal=13000 | Anomalous=1000
+validation: (3000, 100, 8) | Normal=2785 | Anomalous=215
+test: (3000, 100, 8) | Normal=2785 | Anomalous=215
+Passed equipment, window, and duplicate leakage checks.
+Saved train_mamba.npz: (14000, 100, 8)
+Saved validation_mamba.npz: (3000, 100, 8)
+Saved test_mamba.npz: (3000, 100, 8)
+
+PREPROCESSING COMPLETED
+Output folder: /content/drive/MyDrive/Port Work/Anomaly_Preprocessed
+Labels: 0 = Normal, 1 = Anomalous
+Mamba input layout: batch, time steps, sensor features
+Data origin: SYNTHETIC
+Next stage: Mamba temporal representation learning.
