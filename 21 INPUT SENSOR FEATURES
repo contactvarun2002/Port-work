@@ -1,0 +1,136 @@
+# ============================================================
+# RENAME THE 21 INPUT SENSOR FEATURES
+# Saves separate copies; original files remain unchanged.
+# ============================================================
+
+from pathlib import Path
+import json
+import numpy as np
+import pandas as pd
+
+from google.colab import drive
+
+if not Path("/content/drive/MyDrive").is_dir():
+    drive.mount("/content/drive", force_remount=False)
+
+INPUT_FOLDER = Path(
+    "/content/drive/MyDrive/Port Work/"
+    "Anomaly_21Features_Mamba_PyTorch_SYNTHETIC/Data"
+)
+
+OUTPUT_FOLDER = INPUT_FOLDER.parent / "Data_Renamed"
+
+FEATURE_NAME_MAPPING = {
+    "H1InverterTemperature": "Hoist1_Inverter_Temperature",
+    "D1MotorTemperature": "Drive1_Motor_Temperature",
+    "D2InverterTemperature": "Drive2_Inverter_Temperature",
+    "H2InverterTemperature": "Hoist2_Inverter_Temperature",
+    "D3InverterTemperature": "Drive3_Inverter_Temperature",
+    "H1MotorTemperature": "Hoist1_Motor_Temperature",
+    "Hoist2TorqueReference": "Hoist2_Torque_Setpoint",
+    "AmbientTemperature": "Ambient_Air_Temperature",
+    "D1InverterTemperature": "Drive1_Inverter_Temperature",
+    "Hoist1TorqueReference": "Hoist1_Torque_Setpoint",
+    "EngineErrorSlot3": "Engine_Error_Slot_3",
+    "D4InverterTemperature": "Drive4_Inverter_Temperature",
+    "Hoist2SpeedReference": "Hoist2_Speed_Setpoint",
+    "Hoist1SpeedReference": "Hoist1_Speed_Setpoint",
+    "D3MotorTemperature": "Drive3_Motor_Temperature",
+    "H2MotorTemperature": "Hoist2_Motor_Temperature",
+    "D2MotorTemperature": "Drive2_Motor_Temperature",
+    "EngineErrorSlot1": "Engine_Error_Slot_1",
+    "EngineErrorSlot5": "Engine_Error_Slot_5",
+    "EngineTemperature": "Engine_Operating_Temperature",
+    "D4MotorTemperature": "Drive4_Motor_Temperature",
+}
+
+assert len(set(FEATURE_NAME_MAPPING.values())) == 21
+
+if not INPUT_FOLDER.is_dir():
+    raise FileNotFoundError(
+        f"Folder not found:\n{INPUT_FOLDER}\n"
+        "Set INPUT_FOLDER to your completed 21-channel Data folder."
+    )
+
+# Find and validate files before writing.
+files_to_process = []
+
+for path in sorted(INPUT_FOLDER.glob("*.npz")):
+
+    with np.load(path, allow_pickle=False) as stored:
+
+        if "feature_names" not in stored.files:
+            continue
+
+        original_names = stored["feature_names"].astype(str).tolist()
+
+    if (
+        len(original_names) != 21
+        or set(original_names) != set(FEATURE_NAME_MAPPING)
+    ):
+        raise ValueError(
+            f"{path.name}: expected the 21 original sensor names.\n"
+            "Do not use this mapping on eight-channel data or "
+            "128-dimensional Mamba embeddings."
+        )
+
+    files_to_process.append(path)
+
+if not files_to_process:
+    raise FileNotFoundError(
+        "No NPZ files containing sensor feature_names were found."
+    )
+
+OUTPUT_FOLDER.mkdir(parents=True, exist_ok=True)
+
+for path in files_to_process:
+
+    with np.load(path, allow_pickle=False) as stored:
+        arrays = {
+            key: stored[key].copy()
+            for key in stored.files
+        }
+
+    original_names = arrays["feature_names"].astype(str).tolist()
+
+    arrays["feature_names"] = np.asarray([
+        FEATURE_NAME_MAPPING[name]
+        for name in original_names
+    ])
+
+    destination = OUTPUT_FOLDER / path.name
+
+    np.savez_compressed(destination, **arrays)
+
+    # Verify every array except the names remains unchanged.
+    with (
+        np.load(path, allow_pickle=False) as original,
+        np.load(destination, allow_pickle=False) as renamed,
+    ):
+        for key in original.files:
+            if key != "feature_names":
+                np.testing.assert_equal(
+                    original[key],
+                    renamed[key],
+                )
+
+    print("Renamed and verified:", destination.name, flush=True)
+
+pd.DataFrame(
+    FEATURE_NAME_MAPPING.items(),
+    columns=["Original_Name", "New_Name"],
+).to_csv(
+    OUTPUT_FOLDER / "feature_name_mapping.csv",
+    index=False,
+)
+
+with open(
+    OUTPUT_FOLDER / "feature_name_mapping.json",
+    "w",
+    encoding="utf-8",
+) as file:
+    json.dump(FEATURE_NAME_MAPPING, file, indent=2)
+
+print("\nCompleted.")
+print("Saved renamed copies to:", OUTPUT_FOLDER)
+print("Sensor values, labels, IDs, and channel order are unchanged.")
