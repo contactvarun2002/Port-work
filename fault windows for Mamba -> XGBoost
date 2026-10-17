@@ -1,0 +1,136 @@
+"""Preprocess synthetic fault windows for Mamba -> XGBoost.
+Paste this entire script into a Colab cell, or upload and run with %run.
+For local use, set INPUT_PATH and OUTPUT_PATH below.
+No training, resplitting, synthetic generation, or reference metrics substitution.
+"""
+from pathlib import Path
+import io, json, zipfile
+import numpy as np
+import pandas as pd
+
+# Leave INPUT_PATH='/content/drive/MyDrive/Port Work/Synthetic_Fault_Temporal_Dataset' to select/upload the fault ZIP in Colab.
+INPUT_PATH='/content/drive/MyDrive/Port Work/Synthetic_Fault_Temporal_Dataset'
+OUTPUT_PATH='/content/drive/MyDrive/Port Work/Fault_Preprocessed'  # Default: /content/drive/MyDrive/Port_IoT/Fault_Preprocessed
+
+EXPECTED={'train':[13860,6350], 'validation':[1973,622], 'test':[3947,1245]}
+SENSORS=['pressure_bar','temperature_c','vibration_mm_s','speed_kmh','torque_nm','inclination_deg','acceleration_m_s2','ambient_temperature_c']
+
+def main():
+    # Notebook-safe configuration: no argparse or Jupyter kernel arguments.
+    from types import SimpleNamespace
+    args=SimpleNamespace(input=INPUT_PATH, output=OUTPUT_PATH)
+    try:
+        from google.colab import drive, files
+        colab=True
+    except ImportError:
+        colab=False
+    if colab:
+        if not Path('/content/drive/MyDrive').is_dir():
+            drive.mount('/content/drive',force_remount=False)
+        default_out=Path('/content/drive/MyDrive/Port_IoT/Fault_Preprocessed')
+    else:
+        default_out=Path.cwd()/'Fault_Preprocessed'
+    if args.input:
+        source=Path(args.input).expanduser()
+    elif colab:
+        candidates=[Path('/content/Synthetic_Fault_Temporal_Dataset.zip'),Path('/content/drive/MyDrive/Synthetic_Fault_Temporal_Dataset.zip'),Path('/content/drive/MyDrive/Port_IoT/Synthetic_Fault_Temporal_Dataset.zip')]
+        source=next((p for p in candidates if p.is_file()),None)
+        if source is None:
+            print('Upload Synthetic_Fault_Temporal_Dataset.zip (do not upload the fault package).')
+            uploaded=files.upload()
+            names=[name for name in uploaded if name.lower().endswith('.zip')]
+            if len(names)!=1: raise ValueError('Upload exactly one fault ZIP.')
+            source=Path(names[0])
+    else:
+        raise ValueError('Provide --input /path/to/Synthetic_Fault_Temporal_Dataset.zip')
+    if not source.exists() and source.with_suffix('.zip').is_file():
+        source=source.with_suffix('.zip')
+    if source.is_dir() and not (source/'fault'/'train_labels.csv').is_file():
+        candidates=[p.parent.parent for p in source.rglob('train_labels.csv') if p.parent.name=='fault']
+        if len(candidates)!=1: raise ValueError('Expected exactly one complete fault folder under '+str(source))
+        source=candidates[0]
+    if not source.exists(): raise FileNotFoundError('Set INPUT_PATH to your fault folder or ZIP: '+str(source))
+    out=Path(args.output) if args.output else default_out
+    archive=zipfile.ZipFile(source) if source.is_file() else None
+    def read(relative):
+        if archive:
+            try: return archive.read(relative)
+            except KeyError: raise ValueError(f'Missing {relative}. Use the fault sequence package.')
+        return (source/relative).read_bytes()
+    try:
+        metadata=json.loads(read('metadata.json'))
+        if metadata.get('synthetic') is not True:
+            raise ValueError('This script is specifically for the supplied synthetic package.')
+        report={'data_origin':'synthetic demonstration only','fit_subset':'all training windows only','sampling_interval_seconds':0.1,'smoothing':'disabled to preserve spikes','duplicates':'exact labeled repeated sequences rejected, not silently deleted','splits':{}}
+        splits={}; all_ids=set(); equipment_sets={}; hash_sets={}
+        import hashlib
+        for split,counts in EXPECTED.items():
+            df=pd.read_csv(io.BytesIO(read(f'fault/{split}_labels.csv')),dtype={'window_id':str,'equipment_id':str})
+            required={'window_id','equipment_id','window_start','window_end','split','is_synthetic','label','class_name'}
+            if not required.issubset(df.columns): raise ValueError(f'{split}: missing metadata columns {required-set(df.columns)}')
+            if df[list(required)].isna().any().any(): raise ValueError(f'{split}: missing labels or identifiers')
+            if df.window_id.duplicated().any(): raise ValueError(f'{split}: duplicate window IDs')
+            if not df['split'].eq(split).all(): raise ValueError('Split metadata mismatch')
+            if not df.is_synthetic.astype(str).str.lower().eq('true').all(): raise ValueError('Missing synthetic provenance')
+            y=pd.to_numeric(df.label,errors='raise').to_numpy()
+            if not np.isin(y,[0,1]).all(): raise ValueError('Expected labels 0=Normal, 1=Faulty')
+            y=y.astype(np.int64)
+            if np.bincount(y,minlength=2).tolist()!=counts: raise ValueError(f'{split}: class counts differ from requested counts')
+            if not np.array_equal(df.class_name.to_numpy(),np.array(['Normal','Faulty'])[y]): raise ValueError('Class names disagree with labels')
+            with np.load(io.BytesIO(read(f'sequences/{split}_sequences.npz')),allow_pickle=False) as a:
+                x=a['X'].astype(np.float32)
+                ids=a['window_id'].astype(str); eq=a['equipment_id'].astype(str); features=a['feature_names'].astype(str).tolist()
+            if features!=SENSORS: raise ValueError(f'Unexpected feature order: {features}')
+            if x.shape!=(sum(counts),100,8): raise ValueError(f'{split}: unexpected sequence shape {x.shape}')
+            if len(ids)!=len(x) or len(eq)!=len(x) or len(set(ids))!=len(ids): raise ValueError('Invalid sequence identifiers')
+            if set(ids)!=set(df.window_id): raise ValueError('Sequence/label ID mismatch')
+            df=df.set_index('window_id').loc[ids].reset_index()
+            y=df.label.to_numpy(dtype=np.int64)
+            if not np.array_equal(eq,df.equipment_id.to_numpy()): raise ValueError('Equipment ID mismatch')
+            if all_ids.intersection(ids): raise ValueError('Window leakage across splits')
+            all_ids.update(ids)
+            equipment_sets[split]=set(eq)
+            for old in splits:
+                if equipment_sets[old]&equipment_sets[split]: raise ValueError('Equipment leakage across splits')
+            starts=pd.to_datetime(df.window_start,utc=True,errors='raise');ends=pd.to_datetime(df.window_end,utc=True,errors='raise')
+            if not np.allclose((ends-starts).dt.total_seconds(),9.9): raise ValueError('Expected 100 readings at 100 ms per window')
+            for equipment,group in df.assign(_start=starts,_end=ends).groupby('equipment_id'):
+                group=group.sort_values('_start')
+                if (group._start.iloc[1:].to_numpy()<=group._end.iloc[:-1].to_numpy()).any(): raise ValueError('Overlapping equipment windows')
+            # Duplicate values across separate sensors/times are legitimate; only full repeated windows are checked.
+            hashes=[hashlib.sha256(row.tobytes()).hexdigest() for row in x]
+            if len(set(hashes))!=len(hashes): raise ValueError(f'{split}: duplicate complete sensor sequences; investigate instead of forcing counts')
+            for old in hash_sets:
+                if set(hashes)&hash_sets[old]: raise ValueError('Repeated sequences across splits')
+            hash_sets[split]=set(hashes)
+            bad=~np.isfinite(x)
+            report['splits'][split]={'shape':list(x.shape),'normal':int((y==0).sum()),'faulty':int((y==1).sum()),'equipment_count':len(set(eq)),'nonfinite_values_imputed':int(bad.sum())}
+            x[bad]=np.nan
+            splits[split]=(x,y,df)
+        # Training normal data only: no validation/test statistics enter preprocessing.
+        normal=splits['train'][0].reshape(-1,len(SENSORS))
+        with np.errstate(invalid='ignore'):
+            means=np.nanmean(normal,axis=0,dtype=np.float64)
+        if not np.isfinite(means).all(): raise ValueError('A sensor has no valid training measurements')
+        normal=np.where(np.isnan(normal),means,normal)
+        center=normal.mean(axis=0,dtype=np.float64)
+        scale=normal.std(axis=0,dtype=np.float64)
+        constant=scale<1e-12; scale[constant]=1.0
+        out.mkdir(parents=True,exist_ok=True)
+        np.savez(out/'preprocessing_parameters.npz',imputation_mean=means,mean=center,scale=scale,feature_names=np.array(SENSORS))
+        for split,(x,y,df) in splits.items():
+            x=np.where(np.isnan(x),means,x)
+            x=((x-center)/scale).astype(np.float32)
+            if not np.isfinite(x).all(): raise ValueError('Nonfinite standardized output')
+            np.savez_compressed(out/f'{split}_mamba.npz',X=x,y=y,window_id=df.window_id.to_numpy(dtype=str),equipment_id=df.equipment_id.to_numpy(dtype=str),feature_names=np.array(SENSORS))
+            df.to_csv(out/f'{split}_manifest.csv',index=False)
+            print(f'{split}: X={x.shape}, labels={np.bincount(y,minlength=2).tolist()}')
+        report['feature_names']=SENSORS;report['constant_training_features']=[SENSORS[i] for i in np.flatnonzero(constant)]
+        (out/'preprocessing_report.json').write_text(json.dumps(report,indent=2))
+        (out/'README.txt').write_text('SYNTHETIC fault data. X layout: windows,time,features. Standardization and mean imputation use ALL training windows only. No smoothing, clipping, resplitting, or augmentation. Preserve manifests for prediction alignment. The supplied dataset has 8 sensor channels, not the 21 paper variables. Counts refer to windows; reference-paper counts refer to records. Validation counts follow the concept and are not verified source data. Labels describe simulated current fault conditions, not a defined future horizon. This cohort cannot be joined by row order to the independently generated anomaly dataset. Next: Mamba temporal learning, then XGBoost fault classification and probability calibration.\n')
+        print('Saved preprocessing outputs to:',out)
+        print('Synthetic demonstration only. No model training performed. Next: Mamba features then XGBoost.')
+    finally:
+        if archive: archive.close()
+
+if __name__=='__main__': main()
