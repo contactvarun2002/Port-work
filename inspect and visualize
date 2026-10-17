@@ -1,0 +1,167 @@
+# Colab: inspect and visualize completed eight-channel anomaly preprocessing.
+# No training or alteration of sensor data. Figures describe synthetic engineered data.
+from pathlib import Path
+import json
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
+from google.colab import drive
+
+ROOT=Path('/content/drive/MyDrive/Port Work/Anomaly_Preprocessed')
+OUT=ROOT/'Results_Visualization'
+EXPECTED={'train':[13000,1000],'validation':[2785,215],'test':[2785,215]}
+BASE_NAMES=['pressure_bar','temperature_c','vibration_mm_s','speed_kmh','torque_nm','inclination_deg','acceleration_m_s2','ambient_temperature_c']
+NAMES=BASE_NAMES.copy()
+COLORS=['#3978a8']*8
+if not Path('/content/drive/MyDrive').is_dir(): drive.mount('/content/drive',force_remount=False)
+if not ROOT.is_dir(): raise FileNotFoundError('Run anomaly preprocessing first: '+str(ROOT))
+OUT.mkdir(parents=True,exist_ok=True)
+rows=[];stats=[];samples={};seen_ids=set();seen_eq=set();rng=np.random.default_rng(42)
+for split,counts in EXPECTED.items():
+    print('Inspecting:',split,flush=True)
+    with np.load(ROOT/f'{split}_mamba.npz',allow_pickle=False) as a:
+        x=a['X'].astype(np.float32);y=a['y'];names=a['feature_names'].astype(str).tolist()
+        ids=a['window_id'].astype(str);eq=a['equipment_id'].astype(str)
+    if names!=NAMES or x.shape!=(sum(counts),100,8): raise ValueError('Unexpected feature names or shape')
+    if not np.isfinite(x).all() or not np.isin(y,[0,1]).all(): raise ValueError('Invalid values or labels')
+    if np.bincount(y.astype(int),minlength=2).tolist()!=counts: raise ValueError('Unexpected class counts')
+    if len(ids)!=len(y) or len(eq)!=len(y) or len(set(ids))!=len(ids): raise ValueError('Invalid identifiers')
+    if seen_ids&set(ids) or seen_eq&set(eq): raise ValueError('Cross-split overlap')
+    seen_ids.update(ids);seen_eq.update(eq)
+    rows.append({'split':split,'windows':len(y),'normal':counts[0],'anomalous':counts[1],
+        'time_steps':100,'channels':8,'sensor_readings':len(y)*100,'equipment':len(set(eq)),
+        'missing_values':int(np.isnan(x).sum()),'infinite_values':int(np.isinf(x).sum())})
+    flat=x.reshape(-1,8)
+    means=flat.mean(0,dtype=np.float64);std=flat.std(0,dtype=np.float64)
+    for j,name in enumerate(names):
+        stats.append({'split':split,'feature':name,'mean':means[j],'std':std[j],
+            'minimum':float(flat[:,j].min()),'maximum':float(flat[:,j].max())})
+    if split=='train':
+        normal_flat=x[y==0].reshape(-1,8)
+        reference_stats=pd.DataFrame({'feature':NAMES,
+            'normal_training_mean':normal_flat.mean(0,dtype=np.float64),
+            'normal_training_std':normal_flat.std(0,dtype=np.float64)})
+        reference_stats.to_csv(OUT/'normal_training_scaling_check.csv',index=False)
+        del normal_flat
+        # Bounded sample of time points for descriptive plots, not model selection.
+        idx=rng.choice(len(flat),min(20000,len(flat)),replace=False)
+        sampled=flat[idx].copy()
+    if split=='test':
+        for label in [0,1]:
+            i=int(np.flatnonzero(y==label)[0]);samples[label]=(x[i].copy(),str(ids[i]),str(eq[i]))
+    del x,flat
+summary=pd.DataFrame(rows);statistics=pd.DataFrame(stats)
+summary.to_csv(OUT/'dataset_summary.csv',index=False)
+statistics.to_csv(OUT/'feature_statistics.csv',index=False)
+print('\nVERIFIED DATASET SUMMARY')
+print(summary.to_string(index=False))
+print('\nTotal windows:',summary.windows.sum())
+try:
+    from IPython.display import display
+    display(summary)
+except ImportError: pass
+
+def save(fig,name):
+    fig.tight_layout();fig.savefig(OUT/name,dpi=200,bbox_inches='tight');plt.show();plt.close(fig)
+
+# 1. Class balance by split.
+fig,ax=plt.subplots(figsize=(8,4.5));positions=np.arange(len(summary));width=.36
+b1=ax.bar(positions-width/2,summary.normal,width,label='Normal',color='#3978a8')
+b2=ax.bar(positions+width/2,summary.anomalous,width,label='Anomalous',color='#d26449')
+ax.bar_label(b1,padding=3);ax.bar_label(b2,padding=3)
+ax.set_xticks(positions,summary.split);ax.set(ylabel='Windows',title='Anomaly dataset class counts');ax.legend()
+save(fig,'class_distribution.png')
+
+# 3. Mean/std across splits for a scaling diagnostic. Not feature importance.
+fig,axes=plt.subplots(2,1,figsize=(14,8),sharex=True)
+for split in EXPECTED:
+    table=statistics.loc[statistics.split.eq(split)].set_index('feature').loc[NAMES]
+    axes[0].plot(np.arange(8),table['mean'],marker='o',ms=3,label=split)
+    axes[1].plot(np.arange(8),table['std'],marker='o',ms=3,label=split)
+axes[0].axhline(0,color='gray',ls='--');axes[1].axhline(1,color='gray',ls='--')
+axes[0].set(ylabel='Mean',title='Channel statistics after training-only standardization')
+axes[1].set(ylabel='Standard deviation');axes[0].legend();axes[1].legend()
+axes[1].set_xticks(np.arange(8),NAMES,rotation=90,fontsize=8)
+save(fig,'standardization_diagnostics.png')
+
+# Scaling is fitted to NORMAL training windows, not the entire mixed training split.
+fig,axes=plt.subplots(1,2,figsize=(12,4.5))
+axes[0].bar(NAMES,reference_stats.normal_training_mean,color='#3978a8')
+axes[0].axhline(0,color='gray',ls='--');axes[0].set(ylabel='Mean',title='Normal-training means (expected near zero)')
+axes[1].bar(NAMES,reference_stats.normal_training_std,color='#369f77')
+axes[1].axhline(1,color='gray',ls='--');axes[1].set(ylabel='Standard deviation',title='Normal-training std (near one unless constant)')
+for ax in axes: ax.tick_params(axis='x',rotation=90)
+save(fig,'normal_training_scaling_check.png')
+
+# 4. Sampled training feature distributions.
+fig,ax=plt.subplots(figsize=(15,6))
+bp=ax.boxplot([sampled[:,j] for j in range(8)],showfliers=False,patch_artist=True)
+for box,color in zip(bp['boxes'],COLORS): box.set_facecolor(color);box.set_alpha(.65)
+ax.set_xticks(np.arange(1,9),NAMES,rotation=90,fontsize=8)
+ax.set(ylabel='Standardized channel value',title='Training-channel distributions (sampled time points; outlier markers hidden)')
+save(fig,'training_feature_distributions.png')
+
+# 5. Correlation matrix on sampled training time points.
+corr=pd.DataFrame(sampled,columns=NAMES).corr()
+corr.to_csv(OUT/'sampled_training_correlations.csv')
+fig,ax=plt.subplots(figsize=(13,11));im=ax.imshow(corr.to_numpy(),vmin=-1,vmax=1,cmap='coolwarm')
+ax.set_xticks(np.arange(8),NAMES,rotation=90,fontsize=8)
+ax.set_yticks(np.arange(8),NAMES,fontsize=8)
+ax.set_title('Channel correlations — sampled synthetic training time points')
+fig.colorbar(im,ax=ax,label='Pearson correlation');save(fig,'training_correlation_heatmap.png')
+
+# 6. Example normal/anomalous window heatmaps. These are examples, not model detections.
+fig,axes=plt.subplots(2,1,figsize=(14,8),sharex=True)
+limit=max(float(np.max(np.abs(v[0]))) for v in samples.values())
+for label,ax in enumerate(axes):
+    values,window,equipment=samples[label]
+    im=ax.imshow(values.T,aspect='auto',origin='lower',cmap='coolwarm',vmin=-limit,vmax=limit)
+    ax.set_yticks(np.arange(8),NAMES,fontsize=7)
+    ax.set_title(f"{'Normal' if label==0 else 'Anomalous'} example: {window} / {equipment}")
+    fig.colorbar(im,ax=ax,label='Standardized value')
+axes[-1].set_xlabel('Time-step index (100 ms per step)')
+save(fig,'example_window_heatmaps.png')
+
+# 7. Example temperature curves in original units, recovered using saved scaler.
+with np.load(ROOT/'preprocessing_parameters.npz',allow_pickle=False) as a:
+    means=a['scaler_mean'] if 'scaler_mean' in a.files else a['mean']
+    scales=a['scaler_std'] if 'scaler_std' in a.files else a['scale']
+    if a['feature_names'].astype(str).tolist()!=NAMES: raise ValueError('Scaler channel order mismatch')
+fig,axes=plt.subplots(2,1,figsize=(10,6),sharex=True)
+for label,ax in enumerate(axes):
+    values,window,equipment=samples[label]
+    temperature=values[:,1]*scales[1]+means[1]
+    ax.plot(np.arange(100)*.1,temperature)
+    ax.set(ylabel='Temperature (°C)',title=f"{'Normal' if label==0 else 'Anomalous'} example: {window}")
+axes[-1].set_xlabel('Seconds from window start')
+save(fig,'example_temperature_original_units.png')
+# Display the recorded preprocessing report, without inventing cleaning statistics.
+report_path=ROOT/'preprocessing_report.json'
+if report_path.is_file():
+    report=json.loads(report_path.read_text())
+    print('\nRECORDED PREPROCESSING REPORT:')
+    print(json.dumps(report,indent=2))
+    (OUT/'source_preprocessing_report.json').write_text(json.dumps(report,indent=2))
+    records=[]
+    for split,entry in report.get('splits',{}).items():
+        records.append({'split':split,'nonfinite_values_imputed':entry.get('missing_or_infinite_values',entry.get('nonfinite_values_imputed',None))})
+    table=pd.DataFrame(records)
+    table.to_csv(OUT/'recorded_imputation_counts.csv',index=False)
+    if not table.empty and table.nonfinite_values_imputed.notna().all():
+        fig,ax=plt.subplots(figsize=(7,4));bars=ax.bar(table.split,table.nonfinite_values_imputed,color='#3978a8')
+        ax.bar_label(bars,padding=3);ax.set(ylabel='Sensor values',title='Recorded missing/infinite values imputed')
+        save(fig,'recorded_imputation_counts.png')
+(OUT/'visualization_notes.json').write_text(json.dumps({'data_origin':'synthetic','stage':'anomaly preprocessing only',
+    'channels':NAMES,'preprocessing_fit':'normal training windows only',
+    'sampled_training_time_points':min(20000,14000*100),'seed':42,
+    'distribution_units':'standardized except explicitly recovered temperature',
+    'interpretation':'no classifier training, prediction accuracy, feature importance or ROC claimed',
+    'cleaning_statistics':'taken only from existing preprocessing report',
+    'temporal_dependence':'correlations are descriptive; sampled time points are not independent evidence'},indent=2))
+print('\nCompleted. Results and figures saved to:',OUT,flush=True)
+
+
+
+
+
