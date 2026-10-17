@@ -1,0 +1,381 @@
+# ============================================================
+# MAMBA REPRESENTATION RESULTS + VISUALIZATION
+# Run after the supplied training / feature extraction script.
+#
+# Uses actual saved outputs; does not invent performance values.
+# ============================================================
+
+from pathlib import Path
+import json
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from google.colab import drive
+from IPython.display import display
+
+if not Path("/content/drive/MyDrive").is_dir():
+    drive.mount("/content/drive", force_remount=False)
+
+ROOT = Path(
+    "/content/drive/MyDrive/Port Work/"
+    "Anomaly_21Features_Mamba_PyTorch_SYNTHETIC"
+)
+REPORTS = ROOT / "Results_Visualization"
+REPORTS.mkdir(parents=True, exist_ok=True)
+
+plt.rcParams.update({
+    "figure.dpi": 120,
+    "savefig.dpi": 250,
+    "font.size": 11,
+    "axes.spines.top": False,
+    "axes.spines.right": False,
+})
+
+COLORS = {0: "#2878B5", 1: "#E45756"}
+NAMES = {0: "Normal", 1: "Anomaly"}
+
+def save_plot(fig, name):
+    fig.savefig(
+        REPORTS / f"{name}.png",
+        bbox_inches="tight",
+        facecolor="white"
+    )
+    plt.show()
+    plt.close(fig)
+
+# ------------------------------------------------------------
+# 1. LOAD AND VALIDATE EXTRACTED FEATURES
+# ------------------------------------------------------------
+
+data = {}
+summary = []
+
+for split in ["train", "validation", "test"]:
+    path = ROOT / "Features" / f"{split}_mamba_features.npz"
+
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"Missing: {path}\n"
+            "Finish feature extraction for all splits first."
+        )
+
+    with np.load(path, allow_pickle=False) as a:
+        H = a["H"].astype(np.float32)
+        y = a["y"]
+        ids = a["window_id"].astype(str)
+        equipment = a["equipment_id"].astype(str)
+
+    if H.ndim != 2 or H.shape[1] != 128:
+        raise ValueError(f"{split}: expected (N, 128), found {H.shape}")
+
+    if (
+        len(H) != len(y)
+        or len(ids) != len(y)
+        or len(equipment) != len(y)
+        or not np.isfinite(H).all()
+        or not np.isin(y, [0, 1]).all()
+    ):
+        raise ValueError(f"{split}: invalid features or labels")
+
+    if len(set(ids)) != len(ids):
+        raise ValueError(f"{split}: duplicate window IDs")
+
+    y = y.astype(int)
+    data[split] = {"H": H, "y": y, "ids": ids,
+                   "equipment": equipment}
+
+    summary.append({
+        "Split": split,
+        "Windows": len(y),
+        "Normal": int((y == 0).sum()),
+        "Anomaly": int((y == 1).sum()),
+        "Anomaly_Percent": float(100 * (y == 1).mean()),
+        "Feature_Dimension": H.shape[1],
+        "Equipment_Count": len(set(equipment)),
+        "Synthetic": True,
+    })
+
+for left, right in [
+    ("train", "validation"),
+    ("train", "test"),
+    ("validation", "test"),
+]:
+    for key in ["ids", "equipment"]:
+        if set(data[left][key]) & set(data[right][key]):
+            raise ValueError(
+                f"Overlap between {left} and {right}: {key}"
+            )
+
+summary_df = pd.DataFrame(summary)
+summary_df.to_csv(REPORTS / "01_dataset_summary.csv", index=False)
+
+print("SYNTHETIC DATA — MAMBA REPRESENTATION RESULTS")
+display(summary_df.round(3))
+
+# ------------------------------------------------------------
+# 2. TRAINING AND VALIDATION RECONSTRUCTION LOSS
+# ------------------------------------------------------------
+
+history_path = ROOT / "training_history.csv"
+if not history_path.is_file():
+    raise FileNotFoundError(f"Missing training history: {history_path}")
+
+history = pd.read_csv(history_path)
+required = {"epoch", "train_normal_mse", "validation_normal_mse"}
+if not required.issubset(history.columns) or history.empty:
+    raise ValueError("Training history is empty or missing loss columns.")
+
+if not np.isfinite(
+    history[list(required)].to_numpy(dtype=float)
+).all():
+    raise ValueError("Training history contains invalid values.")
+
+best = history.loc[history["validation_normal_mse"].idxmin()]
+
+fig, ax = plt.subplots(figsize=(9, 5))
+ax.plot(
+    history["epoch"], history["train_normal_mse"],
+    marker="o", label="Normal training windows"
+)
+ax.plot(
+    history["epoch"], history["validation_normal_mse"],
+    marker="s", label="Normal validation windows"
+)
+ax.axvline(
+    best["epoch"], linestyle="--", color="gray",
+    label=f"Best checkpoint: epoch {int(best['epoch'])}"
+)
+ax.set(
+    xlabel="Epoch",
+    ylabel="Reconstruction MSE",
+    title="Mamba reconstruction learning — synthetic data"
+)
+ax.grid(alpha=0.2)
+ax.legend()
+save_plot(fig, "02_training_validation_loss")
+
+training_result = {
+    "synthetic": True,
+    "epochs_completed": int(len(history)),
+    "best_epoch": int(best["epoch"]),
+    "best_validation_normal_mse": float(
+        best["validation_normal_mse"]
+    ),
+    "train_normal_mse_at_best_epoch": float(
+        best["train_normal_mse"]
+    ),
+}
+
+if "epoch_seconds" in history.columns:
+    training_result["total_epoch_time_minutes"] = float(
+        history["epoch_seconds"].sum() / 60
+    )
+
+(REPORTS / "03_training_summary.json").write_text(
+    json.dumps(training_result, indent=2)
+)
+display(pd.DataFrame([training_result]).round(6))
+
+# ------------------------------------------------------------
+# 3. CLASS DISTRIBUTION
+# ------------------------------------------------------------
+
+fig, ax = plt.subplots(figsize=(8, 5))
+positions = np.arange(len(summary_df))
+width = 0.35
+
+for offset, name, color in [
+    (-width / 2, "Normal", COLORS[0]),
+    (width / 2, "Anomaly", COLORS[1]),
+]:
+    bars = ax.bar(
+        positions + offset,
+        summary_df[name],
+        width=width,
+        label=name,
+        color=color
+    )
+    ax.bar_label(bars, padding=3, fontsize=9)
+
+ax.set_xticks(positions, summary_df["Split"].str.title())
+ax.set(
+    ylabel="Number of windows",
+    title="Synthetic dataset class distribution"
+)
+ax.margins(y=0.15)
+ax.legend()
+save_plot(fig, "04_class_distribution")
+
+# ------------------------------------------------------------
+# 4. PCA — FIT ONLY ON TRAINING EMBEDDINGS
+# ------------------------------------------------------------
+
+scaler = StandardScaler()
+train_scaled = scaler.fit_transform(data["train"]["H"])
+
+pca = PCA(n_components=2, svd_solver="full")
+pca.fit(train_scaled)
+
+pca_tables = []
+
+fig, axes = plt.subplots(
+    1, 3, figsize=(17, 5), sharex=True, sharey=True
+)
+
+for ax, split in zip(axes, data):
+    item = data[split]
+    coordinates = pca.transform(scaler.transform(item["H"]))
+
+    for label in [0, 1]:
+        mask = item["y"] == label
+        ax.scatter(
+            coordinates[mask, 0],
+            coordinates[mask, 1],
+            s=8,
+            alpha=0.35 if label == 0 else 0.7,
+            color=COLORS[label],
+            label=f"{NAMES[label]} (n={mask.sum():,})",
+            rasterized=True
+        )
+
+    ax.set_title(split.title())
+    ax.set_xlabel(
+        f"PC1 ({100*pca.explained_variance_ratio_[0]:.1f}%)"
+    )
+    ax.legend(fontsize=8)
+    ax.grid(alpha=0.15)
+
+    pca_tables.append(pd.DataFrame({
+        "split": split,
+        "window_id": item["ids"],
+        "label": item["y"],
+        "PC1": coordinates[:, 0],
+        "PC2": coordinates[:, 1],
+        "is_synthetic": True,
+    }))
+
+axes[0].set_ylabel(
+    f"PC2 ({100*pca.explained_variance_ratio_[1]:.1f}%)"
+)
+fig.suptitle(
+    "Mamba embeddings — PCA fitted on synthetic training data"
+)
+fig.tight_layout()
+save_plot(fig, "05_pca_embeddings")
+
+pd.concat(pca_tables, ignore_index=True).to_csv(
+    REPORTS / "06_pca_coordinates.csv", index=False
+)
+
+# ------------------------------------------------------------
+# 5. LEARNED FEATURE VARIANCE
+# ------------------------------------------------------------
+
+feature_names = [
+    f"Mamba_Feature_{i+1:03d}" for i in range(128)
+]
+
+feature_stats = pd.DataFrame({
+    "Feature": feature_names,
+    "Train_Mean": data["train"]["H"].mean(axis=0),
+    "Train_Std": data["train"]["H"].std(axis=0),
+    "Train_Variance": data["train"]["H"].var(axis=0),
+    "Train_Zero_Fraction": (
+        data["train"]["H"] == 0
+    ).mean(axis=0),
+})
+
+feature_stats.to_csv(
+    REPORTS / "07_embedding_feature_statistics.csv",
+    index=False
+)
+
+top = feature_stats.nlargest(20, "Train_Variance").sort_values(
+    "Train_Variance"
+)
+
+fig, ax = plt.subplots(figsize=(9, 7))
+ax.barh(top["Feature"], top["Train_Variance"], color="#2878B5")
+ax.set(
+    xlabel="Variance across training windows",
+    title="20 highest-variance Mamba dimensions — synthetic data"
+)
+save_plot(fig, "08_embedding_variance")
+
+# ------------------------------------------------------------
+# 6. CLASS-MEAN EMBEDDING HEATMAP
+# Training-fitted scaling; descriptive, not feature importance.
+# ------------------------------------------------------------
+
+means = []
+row_names = []
+
+for split, item in data.items():
+    scaled = scaler.transform(item["H"])
+    for label in [0, 1]:
+        mask = item["y"] == label
+        if not mask.any():
+            raise ValueError(f"{split}: missing class {label}")
+        means.append(scaled[mask].mean(axis=0))
+        row_names.append(f"{split.title()} / {NAMES[label]}")
+
+means = np.asarray(means)
+limit = max(float(np.abs(means).max()), 1e-6)
+
+fig, ax = plt.subplots(figsize=(16, 4.5))
+im = ax.imshow(
+    means,
+    aspect="auto",
+    cmap="coolwarm",
+    vmin=-limit,
+    vmax=limit
+)
+ax.set_yticks(np.arange(len(row_names)), row_names)
+ticks = np.arange(0, 128, 8)
+ax.set_xticks(ticks, [str(i + 1) for i in ticks])
+ax.set(
+    xlabel="Mamba feature dimension",
+    title="Mean standardized embedding by class — synthetic data"
+)
+fig.colorbar(
+    im, ax=ax,
+    label="Mean activation / training standard deviation"
+)
+save_plot(fig, "09_class_mean_embedding_heatmap")
+
+pd.DataFrame(
+    means, index=row_names, columns=feature_names
+).to_csv(REPORTS / "10_class_mean_embeddings.csv")
+
+# ------------------------------------------------------------
+# 7. FINAL STATUS
+# ------------------------------------------------------------
+
+constant_count = int(
+    (feature_stats["Train_Std"] < 1e-8).sum()
+)
+
+print("\nRESULTS")
+print("- All three feature files passed shape and finite-value checks.")
+print("- No window-ID or equipment-ID overlap across splits.")
+print(f"- Learned feature dimension: {data['train']['H'].shape[1]}")
+print(f"- Completed epochs: {len(history)}")
+print(f"- Best epoch: {int(best['epoch'])}")
+print(
+    "- Best validation normal-window MSE:",
+    f"{best['validation_normal_mse']:.6f}"
+)
+print(f"- Near-constant training dimensions: {constant_count}/128")
+print(
+    "- Variance explained by the two displayed PCA components:",
+    f"{100*pca.explained_variance_ratio_.sum():.2f}%"
+)
+print("\nSaved plots and tables:", REPORTS)
+print(
+    "\nScope: synthetic representation learning. "
+    "Classification metrics require an anomaly score and a "
+    "validation-selected decision threshold."
+)
