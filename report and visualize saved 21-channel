@@ -1,0 +1,90 @@
+# Colab: report and visualize saved 21-channel renaming results. No renaming or training.
+from pathlib import Path
+import json
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from google.colab import drive
+
+BASE=Path('/content/drive/MyDrive/Port Work/Anomaly_21Features_Mamba_PyTorch_SYNTHETIC')
+ORIGINAL=BASE/'Data'
+RENAMED=BASE/'Data_Renamed'
+OUT=RENAMED/'Results_Visualization'
+if not Path('/content/drive/MyDrive').is_dir(): drive.mount('/content/drive',force_remount=False)
+mapping_path=RENAMED/'feature_name_mapping.json'
+if not mapping_path.is_file(): raise FileNotFoundError('Run the renaming code first: '+str(mapping_path))
+mapping=json.loads(mapping_path.read_text())
+if len(mapping)!=21 or len(set(mapping.values()))!=21: raise ValueError('Expected 21 unique old/new names')
+files=sorted(RENAMED.glob('*.npz'))
+if not files: raise FileNotFoundError('No renamed NPZ files found.')
+OUT.mkdir(parents=True,exist_ok=True)
+rows=[];example=None
+for path in files:
+    source=ORIGINAL/path.name
+    if not source.is_file(): raise FileNotFoundError('Missing original: '+str(source))
+    print('Checking:',path.name,flush=True)
+    with np.load(source,allow_pickle=False) as old,np.load(path,allow_pickle=False) as new:
+        if set(old.files)!=set(new.files): raise ValueError('Array keys differ')
+        names=old['feature_names'].astype(str).tolist()
+        expected=[mapping[n] for n in names]
+        if new['feature_names'].astype(str).tolist()!=expected: raise ValueError('Names/order disagree with mapping')
+        checked=[]
+        for key in old.files:
+            if key!='feature_names':
+                np.testing.assert_equal(old[key],new[key],err_msg=f'{path.name}: changed array {key}')
+                checked.append(key)
+        shape=None
+        if 'X' in new.files:
+            shape=list(new['X'].shape)
+            if len(shape)!=3 or shape[-1]!=21: raise ValueError('Unexpected sensor tensor shape')
+            if example is None or path.name=='train_mamba21.npz':
+                # Store just one example window for the descriptive comparison plot.
+                example={'file':path.name,'old_name':names[0],'new_name':expected[0],
+                         'old':old['X'][0,:,0].copy(),'new':new['X'][0,:,0].copy()}
+        rows.append({'file':path.name,'channels':len(names),'X_shape':str(shape) if shape else 'parameter arrays',
+                     'renaming_verified':True,'other_arrays_verified_unchanged':True,
+                     'checked_arrays':', '.join(checked)})
+report=pd.DataFrame(rows);report.to_csv(OUT/'rename_verification.csv',index=False)
+name_table=pd.DataFrame({'Channel':np.arange(1,22),'Original name':list(mapping.keys()),'Renamed label':list(mapping.values())})
+name_table.to_csv(OUT/'name_mapping_results.csv',index=False)
+try:
+    from IPython.display import display
+    display(name_table);display(report)
+except ImportError:
+    print(name_table.to_string(index=False));print(report.to_string(index=False))
+
+def save(fig,name):
+    fig.tight_layout();fig.savefig(OUT/name,dpi=200,bbox_inches='tight');plt.show();plt.close(fig)
+
+# Name correspondence is a table, not a sensor-importance plot.
+fig,ax=plt.subplots(figsize=(14,10));ax.axis('off')
+table=ax.table(cellText=name_table.values,colLabels=name_table.columns,cellLoc='left',
+    colLoc='left',loc='center',colWidths=[.07,.43,.50])
+table.auto_set_font_size(False);table.set_fontsize(10);table.scale(1,1.7)
+for (r,c),cell in table.get_celld().items():
+    if r==0: cell.set_facecolor('#24476a');cell.set_text_props(color='white',weight='bold')
+    else: cell.set_facecolor('#edf3f8' if r%2 else '#ffffff')
+ax.set_title('21 input sensor names: verified rename mapping',fontsize=15,pad=15)
+save(fig,'feature_name_mapping.png')
+
+fig,ax=plt.subplots(figsize=(7,4));bars=ax.bar(['Original channels','Renamed channels'],[21,21],color=['#4678a0','#329d77'])
+ax.bar_label(bars,padding=3);ax.set(ylabel='Channel count',ylim=(0,24),title='Renaming preserves channel count')
+save(fig,'channel_count_preserved.png')
+
+if example:
+    fig,axes=plt.subplots(1,2,figsize=(12,4),sharex=True,sharey=True)
+    t=np.arange(len(example['old']))*.1
+    axes[0].plot(t,example['old'],color='#4678a0');axes[0].set_title(example['old_name'])
+    axes[1].plot(t,example['new'],color='#329d77');axes[1].set_title(example['new_name'])
+    for ax in axes: ax.set(xlabel='Seconds from window start',ylabel='Stored sensor value')
+    fig.suptitle('Same window and sensor values; only the name changed')
+    save(fig,'before_after_sensor_trace.png')
+    pd.DataFrame({'time_seconds':t,'original_value':example['old'],'renamed_value':example['new']}).to_csv(OUT/'example_trace_comparison.csv',index=False)
+(OUT/'summary.json').write_text(json.dumps({'channels':21,'files_verified':len(rows),
+    'values_labels_ids_and_parameters_unchanged':True,
+    'name_changes_only':True,'source_data':'synthetic',
+    'scope':'rename verification, not feature extraction or model evaluation',
+    'example_file':None if example is None else example['file']},indent=2))
+print(f'Completed: {len(rows)} files verified; 21 names mapped.')
+print('No sensor values, labels, IDs or parameter arrays changed.')
+print('Saved tables and plots to:',OUT,flush=True)
