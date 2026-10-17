@@ -1,0 +1,82 @@
+# Colab: expand the existing 8 measured/simulated channels to 21 causal engineered channels.
+# No new sensor measurements or labels are invented. This is not the paper's 21-variable dataset.
+from pathlib import Path
+import json
+import numpy as np
+import pandas as pd
+
+INPUT = Path('/content/drive/MyDrive/Port Work/Fault_Preprocessed')
+OUTPUT = Path('/content/drive/MyDrive/Port Work/Fault_21_Engineered_Preprocessed')
+EXPECTED = {'train':[13860,6350],'validation':[1973,622],'test':[3947,1245]}
+SENSORS = ['pressure_bar','temperature_c','vibration_mm_s','speed_kmh','torque_nm','inclination_deg','acceleration_m_s2','ambient_temperature_c']
+ROLLING_SENSORS = SENSORS[:5]
+ROLLING_STEPS = 5
+NAMES = SENSORS + [name+'_step_change' for name in SENSORS] + [name+'_trailing_mean_5' for name in ROLLING_SENSORS]
+
+def engineer(x):
+    if x.ndim!=3 or x.shape[-1]!=8: raise ValueError('Expected (windows,time,8)')
+    difference = np.zeros_like(x)
+    difference[:,1:,:] = x[:,1:,:]-x[:,:-1,:]
+    # Trailing means use only current and previous readings, separately within each window.
+    values=x[:,:,:5].astype(np.float64)
+    cumulative=np.concatenate([np.zeros((len(x),1,5)),np.cumsum(values,axis=1)],axis=1)
+    end=np.arange(1,x.shape[1]+1)
+    start=np.maximum(0,end-ROLLING_STEPS)
+    rolling=(cumulative[:,end,:]-cumulative[:,start,:])/(end-start)[None,:,None]
+    result=np.concatenate([x,difference,rolling.astype(np.float32)],axis=-1)
+    if not np.isfinite(result).all(): raise ValueError('Nonfinite engineered features')
+    return result.astype(np.float32)
+
+def main():
+    from google.colab import drive
+    if not Path('/content/drive/MyDrive').is_dir(): drive.mount('/content/drive',force_remount=False)
+    OUTPUT.mkdir(parents=True,exist_ok=True)
+    assert len(NAMES)==len(set(NAMES))==21
+    data={};seen_ids=set();seen_equipment=set()
+    for split,counts in EXPECTED.items():
+        path=INPUT/f'{split}_mamba.npz'
+        if not path.is_file(): raise FileNotFoundError(path)
+        print('Loading and engineering:',split,flush=True)
+        with np.load(path,allow_pickle=False) as stored:
+            payload={key:stored[key].copy() for key in stored.files}
+        if payload['feature_names'].astype(str).tolist()!=SENSORS:
+            raise ValueError('Unexpected source sensor names/order. Do not rename channels to bypass this check.')
+        x=payload['X'].astype(np.float32);raw_y=payload['y']
+        if not np.isin(raw_y,[0,1]).all(): raise ValueError('Invalid labels')
+        y=raw_y.astype(np.int64)
+        if np.bincount(y,minlength=2).tolist()!=counts or x.shape!=(sum(counts),100,8):
+            raise ValueError('Source shapes/counts differ from expected fault data')
+        if not np.isfinite(x).all(): raise ValueError('Source contains missing/infinite values; run preprocessing first')
+        ids=payload['window_id'].astype(str);eq=payload['equipment_id'].astype(str)
+        if len(ids)!=len(y) or len(eq)!=len(y) or len(set(ids))!=len(ids): raise ValueError('Invalid IDs')
+        if seen_ids&set(ids) or seen_equipment&set(eq): raise ValueError('Split leakage')
+        seen_ids.update(ids);seen_equipment.update(eq)
+        data[split]=(engineer(x),payload)
+    # Fit new channel scaling on all training observations only.
+    training=data['train'][0].reshape(-1,21)
+    mean=training.mean(axis=0,dtype=np.float64)
+    scale=training.std(axis=0,dtype=np.float64);scale[scale<1e-12]=1.
+    np.savez(OUTPUT/'engineered_channel_scaler.npz',mean=mean,scale=scale,feature_names=np.array(NAMES))
+    rows=[]
+    for split,(x,payload) in data.items():
+        x=((x-mean)/scale).astype(np.float32)
+        if not np.isfinite(x).all(): raise ValueError('Invalid scaled output')
+        payload['X']=x;payload['feature_names']=np.array(NAMES)
+        np.savez_compressed(OUTPUT/f'{split}_mamba.npz',**payload)
+        manifest=INPUT/f'{split}_manifest.csv'
+        if not manifest.is_file(): raise FileNotFoundError('Missing timestamp manifest: '+str(manifest))
+        df=pd.read_csv(manifest,dtype={'window_id':str,'equipment_id':str})
+        if df.window_id.duplicated().any() or set(df.window_id)!=set(payload['window_id'].astype(str)): raise ValueError('Manifest mismatch')
+        df=df.set_index('window_id').loc[payload['window_id'].astype(str)].reset_index()
+        if not np.array_equal(df.equipment_id.to_numpy(),payload['equipment_id'].astype(str)): raise ValueError('Manifest equipment mismatch')
+        if not np.array_equal(df.label.to_numpy(),payload['y']): raise ValueError('Manifest label mismatch')
+        df.to_csv(OUTPUT/f'{split}_manifest.csv',index=False)
+        rows.append({'split':split,'windows':len(x),'time_steps':100,'channels':21})
+        print('Saved:',split,x.shape,flush=True)
+    pd.DataFrame({'channel_index':np.arange(21),'feature_name':NAMES,
+        'kind':['original standardized sensor']*8+['step difference']*8+['trailing mean']*5}).to_csv(OUTPUT/'feature_dictionary.csv',index=False)
+    (OUTPUT/'engineering_report.json').write_text(json.dumps({'data_origin':'synthetic source dataset','method':'8 original + 8 step changes + 5 trailing means','difference_first_step':0,'trailing_window_steps':5,'boundary_policy':'reset each window; partial trailing means at window start','fit_statistics':'training split only','source_was_standardized':True,'paper_21_variables_recreated':False,'splits':rows},indent=2))
+    print('Ready for Mamba. Input dimension = 21. Output:',OUTPUT,flush=True)
+    print('These are engineered channels, not the paper-specific inverter/motor measurements.')
+
+if __name__=='__main__': main()
