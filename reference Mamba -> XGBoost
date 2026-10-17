@@ -1,0 +1,217 @@
+# Fault workflow: actual 21 engineered channels -> reference Mamba -> XGBoost.
+# No mamba-ssm compilation, no fabricated sensor names, no fixed performance values.
+from pathlib import Path
+import math, json, random, time, threading
+print('Starting fault feature extraction...',flush=True)
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import torch
+from torch import nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.metrics import (log_loss,accuracy_score,precision_score,recall_score,f1_score,
+    confusion_matrix,ConfusionMatrixDisplay,roc_curve,roc_auc_score,precision_recall_curve,
+    average_precision_score,brier_score_loss)
+try:
+    from xgboost import XGBClassifier
+except ImportError as exc:
+    raise ImportError('Run %pip install xgboost in a separate Colab cell, then rerun this script.') from exc
+from google.colab import drive
+
+BASE=Path('/content/drive/MyDrive/Port Work')
+INPUT=BASE/'Fault_21_Engineered_Preprocessed'
+OUT=BASE/'Fault_Mamba_XGBoost_21_Engineered'
+SEED=42
+EPOCHS=20
+BATCH_SIZE=16
+D_MODEL=128
+D_STATE=16
+N_BLOCKS=4
+EMBEDDING_DIM=128
+PATIENCE=5
+SENSORS=['pressure_bar','temperature_c','vibration_mm_s','speed_kmh','torque_nm','inclination_deg','acceleration_m_s2','ambient_temperature_c']
+EXPECTED_NAMES=SENSORS+[s+'_step_change' for s in SENSORS]+[s+'_trailing_mean_5' for s in SENSORS[:5]]
+EXPECTED_COUNTS={'train':[13860,6350],'validation':[1973,622],'test':[3947,1245]}
+_STATUS={'stage':'Starting'};_STOP=threading.Event();_START=time.monotonic()
+def log(*items): print(f'[{time.monotonic()-_START:.1f}s]',*items,flush=True)
+def stage(name): _STATUS['stage']=name;log(name)
+def heartbeat():
+    while not _STOP.wait(20): log('Running:',_STATUS['stage'])
+
+class ReferenceMamba(nn.Module):
+        """Real-valued Mamba-1-style selective SSM, sequential PyTorch scan.
+        Implements input-dependent dt/B/C, negative diagonal A, D skip and SiLU gate.
+        Independent implementation; not the optimized mamba_ssm package.
+        """
+        def __init__(self,d_model,d_state=16,d_conv=4,expand=2):
+            super().__init__()
+            self.inner=int(expand*d_model);self.state_size=d_state
+            self.rank=math.ceil(d_model/16)
+            self.in_proj=nn.Linear(d_model,2*self.inner,bias=False)
+            self.conv=nn.Conv1d(self.inner,self.inner,d_conv,padding=d_conv-1,groups=self.inner,bias=True)
+            self.x_proj=nn.Linear(self.inner,self.rank+2*d_state,bias=False)
+            self.dt_proj=nn.Linear(self.rank,self.inner,bias=True)
+            nn.init.uniform_(self.dt_proj.weight,-self.rank**-.5,self.rank**-.5)
+            initial_dt=torch.exp(torch.empty(self.inner).uniform_(math.log(.001),math.log(.1)))
+            with torch.no_grad(): self.dt_proj.bias.copy_(initial_dt+torch.log(-torch.expm1(-initial_dt)))
+            self.A_log=nn.Parameter(torch.arange(1,d_state+1,dtype=torch.float32).log().repeat(self.inner,1))
+            self.D=nn.Parameter(torch.ones(self.inner))
+            self.out_proj=nn.Linear(self.inner,d_model,bias=False)
+        def forward(self,inputs):
+            batch,length,_=inputs.shape
+            u,gate=self.in_proj(inputs).chunk(2,dim=-1)
+            u=F.silu(self.conv(u.transpose(1,2))[:,:,:length].transpose(1,2))
+            dt,B,C=torch.split(self.x_proj(u),[self.rank,self.state_size,self.state_size],dim=-1)
+            dt=F.softplus(self.dt_proj(dt))
+            A=-torch.exp(self.A_log.float())
+            state=u.new_zeros(batch,self.inner,self.state_size)
+            outputs=[]
+            for t in range(length):
+                delta=dt[:,t,:]
+                transition=torch.exp(delta.unsqueeze(-1)*A.unsqueeze(0))
+                drive=delta.unsqueeze(-1)*B[:,t,:].unsqueeze(1)*u[:,t,:].unsqueeze(-1)
+                state=transition*state+drive
+                value=(state*C[:,t,:].unsqueeze(1)).sum(-1)+self.D*u[:,t,:]
+                outputs.append(value)
+            y=torch.stack(outputs,dim=1)*F.silu(gate)
+            return self.out_proj(y)
+
+class Block(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.norm1=nn.LayerNorm(D_MODEL)
+        self.ssm=ReferenceMamba(D_MODEL,D_STATE,4,2)
+        self.norm2=nn.LayerNorm(D_MODEL)
+        self.ff=nn.Sequential(nn.Linear(D_MODEL,2*D_MODEL),nn.GELU(),nn.Dropout(.1),nn.Linear(2*D_MODEL,D_MODEL))
+    def forward(self,x):
+        x=x+self.ssm(self.norm1(x))
+        return x+self.ff(self.norm2(x))
+
+class FaultRepresentation(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.projection=nn.Linear(21,D_MODEL)
+        self.blocks=nn.Sequential(*[Block() for _ in range(N_BLOCKS)])
+        self.norm=nn.LayerNorm(D_MODEL)
+        self.embedding=nn.Sequential(nn.Linear(D_MODEL,EMBEDDING_DIM),nn.ReLU())
+        self.classifier=nn.Linear(EMBEDDING_DIM,1)
+    def encode(self,x):
+        return self.embedding(self.norm(self.blocks(self.projection(x))).mean(1))
+    def forward(self,x): return self.classifier(self.encode(x)).squeeze(-1)
+
+def main():
+    random.seed(SEED);np.random.seed(SEED);torch.manual_seed(SEED)
+    if not Path('/content/drive/MyDrive').is_dir(): drive.mount('/content/drive',force_remount=False)
+    if not torch.cuda.is_available(): raise RuntimeError('Select Runtime > Change runtime type > T4 GPU.')
+    device=torch.device('cuda');log('GPU:',torch.cuda.get_device_name(0))
+    OUT.mkdir(parents=True,exist_ok=True);(OUT/'Features').mkdir(exist_ok=True)
+    data={};seen_ids=set();seen_eq=set()
+    for split,counts in EXPECTED_COUNTS.items():
+        stage('Loading '+split)
+        with np.load(INPUT/f'{split}_mamba.npz',allow_pickle=False) as a:
+            x=a['X'].astype(np.float32);raw=a['y'];ids=a['window_id'].astype(str);eq=a['equipment_id'].astype(str)
+            names=a['feature_names'].astype(str).tolist()
+        if names!=EXPECTED_NAMES: raise ValueError('Expected 21 engineered names in their saved order. Do not rename them as paper-specific measurements.')
+        if not np.isin(raw,[0,1]).all(): raise ValueError('Invalid labels')
+        y=raw.astype(np.int64)
+        if np.bincount(y,minlength=2).tolist()!=counts or x.shape!=(sum(counts),100,21): raise ValueError('Unexpected shapes or counts')
+        if not np.isfinite(x).all(): raise ValueError('Nonfinite inputs')
+        if len(ids)!=len(y) or len(eq)!=len(y) or len(set(ids))!=len(y): raise ValueError('Invalid IDs')
+        if seen_ids&set(ids) or seen_eq&set(eq): raise ValueError('Equipment/window leakage')
+        seen_ids.update(ids);seen_eq.update(eq)
+        m=pd.read_csv(INPUT/f'{split}_manifest.csv',dtype={'window_id':str,'equipment_id':str})
+        if m.window_id.duplicated().any() or set(m.window_id)!=set(ids): raise ValueError('Manifest mismatch')
+        m=m.set_index('window_id').loc[ids].reset_index()
+        if not np.array_equal(m.equipment_id.to_numpy(),eq) or not np.array_equal(m.label.to_numpy(),y): raise ValueError('Manifest alignment error')
+        data[split]=(x,y,m);log(split,x.shape,'normal/faulty',counts)
+    pd.DataFrame({'channel_index':np.arange(21),'input_feature_name':EXPECTED_NAMES}).to_csv(OUT/'input_feature_names.csv',index=False)
+    def batches(split,shuffle=False):
+        x,y,_=data[split]
+        return DataLoader(TensorDataset(torch.from_numpy(x),torch.from_numpy(y.astype(np.float32))),batch_size=BATCH_SIZE,shuffle=shuffle,num_workers=0)
+    stage('Creating reference Mamba model')
+    model=FaultRepresentation().to(device)
+    optimizer=torch.optim.AdamW(model.parameters(),lr=.001,weight_decay=1e-4)
+    criterion=nn.BCEWithLogitsLoss()
+    # Supervised temporal representation learning using training fault labels.
+    best=float('inf');stale=0;history=[]
+    for epoch in range(1,EPOCHS+1):
+        values=[];epoch_start=time.monotonic()
+        for training,split in [(True,'train'),(False,'validation')]:
+            stage(f'Mamba epoch {epoch}/{EPOCHS}: {split}')
+            loader=batches(split,training);model.train(training);total=0.;n=0
+            for i,(batch,target) in enumerate(loader,1):
+                batch=batch.to(device);target=target.to(device)
+                with torch.set_grad_enabled(training):
+                    loss=criterion(model(batch),target)
+                    if not torch.isfinite(loss): raise RuntimeError('Nonfinite loss')
+                    if training:
+                        optimizer.zero_grad(set_to_none=True);loss.backward()
+                        nn.utils.clip_grad_norm_(model.parameters(),1.);optimizer.step()
+                total+=loss.item()*len(batch);n+=len(batch)
+                if i==1 or i%50==0 or i==len(loader): log(split,f'batch {i}/{len(loader)}',f'BCE={total/n:.6f}')
+            values.append(total/n)
+        history.append({'epoch':epoch,'train_bce':values[0],'validation_bce':values[1],'epoch_seconds':time.monotonic()-epoch_start})
+        pd.DataFrame(history).to_csv(OUT/'mamba_training_history.csv',index=False)
+        if values[1]<best:
+            best=values[1];stale=0
+            torch.save({'state_dict':model.state_dict(),'input_feature_names':EXPECTED_NAMES},OUT/'best_fault_mamba.pt')
+        else:
+            stale+=1
+            if stale>=PATIENCE: log('Early stopping.');break
+    model.load_state_dict(torch.load(OUT/'best_fault_mamba.pt',map_location=device,weights_only=True)['state_dict']);model.eval()
+    embeddings={}
+    for split,(x,y,m) in data.items():
+        stage('Extracting '+split+' temporal embeddings');parts=[]
+        loader=batches(split)
+        with torch.no_grad():
+            for i,(batch,_) in enumerate(loader,1):
+                parts.append(model.encode(batch.to(device)).cpu().numpy())
+                if i==1 or i%50==0 or i==len(loader): log('Extract',split,f'{i}/{len(loader)}')
+        h=np.concatenate(parts)
+        if h.shape!=(len(y),128) or not np.isfinite(h).all(): raise ValueError('Invalid extracted features')
+        embeddings[split]=h
+        np.savez_compressed(OUT/'Features'/f'{split}_mamba_features.npz',H=h,y=y,window_id=m.window_id.to_numpy(dtype=str),equipment_id=m.equipment_id.to_numpy(dtype=str))
+        table=pd.DataFrame(h,columns=[f'Mamba_Feature_{i+1:03d}' for i in range(128)])
+        for col in ['window_id','equipment_id','window_start','window_end']: table[col]=m[col].to_numpy()
+        table['label']=y;table['is_synthetic']=True
+        table.to_csv(OUT/'Features'/f'{split}_mamba_features.csv',index=False)
+    stage('Training XGBoost on training Mamba features')
+    xgb=XGBClassifier(n_estimators=300,max_depth=6,learning_rate=.05,subsample=.8,colsample_bytree=.8,
+        reg_lambda=1.,objective='binary:logistic',eval_metric='logloss',tree_method='hist',n_jobs=2,random_state=SEED)
+    xgb.fit(embeddings['train'],data['train'][1],eval_set=[(embeddings['validation'],data['validation'][1])],verbose=25)
+    xgb.save_model(OUT/'fault_xgboost.json')
+    # Threshold selected on validation only. Test does not guide training or selection.
+    pv=xgb.predict_proba(embeddings['validation'])[:,1]
+    p,r,t=precision_recall_curve(data['validation'][1],pv)
+    f=2*p[:-1]*r[:-1]/np.maximum(p[:-1]+r[:-1],1e-12)
+    threshold=float(t[int(np.argmax(f))])
+    (OUT/'threshold.json').write_text(json.dumps({'threshold':threshold,'selection':'maximum validation F1','probability_calibrated':False},indent=2))
+    metrics={}
+    for split,(_,y,m) in data.items():
+        stage('Saving '+split+' fault probability estimates')
+        probability=xgb.predict_proba(embeddings[split])[:,1]
+        pred=(probability>=threshold).astype(int)
+        table=m.copy();table['true_label']=y;table['fault_probability_estimate']=probability
+        table['predicted_fault']=pred;table['threshold']=threshold;table['is_synthetic']=True
+        table.to_csv(OUT/f'{split}_fault_predictions.csv',index=False)
+        metrics[split]={'accuracy':float(accuracy_score(y,pred)),'precision':float(precision_score(y,pred,zero_division=0)),
+            'recall':float(recall_score(y,pred,zero_division=0)),'f1':float(f1_score(y,pred,zero_division=0)),
+            'roc_auc':float(roc_auc_score(y,probability)),'average_precision':float(average_precision_score(y,probability)),
+            'brier_score':float(brier_score_loss(y,probability)),'confusion_matrix':confusion_matrix(y,pred,labels=[0,1]).tolist()}
+        if split=='test': test_y=y;test_p=probability;test_pred=pred
+    (OUT/'metrics.json').write_text(json.dumps({'data_origin':'synthetic','metrics':metrics},indent=2))
+    (OUT/'configuration.json').write_text(json.dumps({'input_names':EXPECTED_NAMES,'d_model':D_MODEL,'d_state':D_STATE,'blocks':N_BLOCKS,'embedding_dim':128,'backend':'independent PyTorch Mamba-1-style reference scan','supervised_temporal_learning':True,'source_preprocessing':'training-only fit performed upstream','probability_calibration':'not performed','fusion':'requires genuinely matching equipment/windows; independent anomaly cohort cannot be joined by row order'},indent=2))
+    fig,axes=plt.subplots(1,2,figsize=(11,4.5))
+    ConfusionMatrixDisplay.from_predictions(test_y,test_pred,labels=[0,1],display_labels=['Normal','Faulty'],ax=axes[0],cmap='Blues',colorbar=False)
+    axes[0].set_title('Fault test confusion matrix')
+    fpr,tpr,_=roc_curve(test_y,test_p);axes[1].plot(fpr,tpr,label=f"AUC={metrics['test']['roc_auc']:.4f}")
+    axes[1].plot([0,1],[0,1],'--',color='gray');axes[1].set(xlabel='False positive rate',ylabel='True positive rate',title='Fault test ROC');axes[1].legend()
+    fig.suptitle('Mamba + XGBoost — synthetic fault data');fig.tight_layout();fig.savefig(OUT/'test_confusion_roc.png',dpi=200);plt.show();plt.close(fig)
+    log('TEST metrics:',json.dumps(metrics['test'],indent=2));log('Completed:',OUT)
+    log('Probability estimates are not calibrated; labels describe current simulated faults, not a future failure horizon.')
+
+if __name__=='__main__':
+    worker=threading.Thread(target=heartbeat,daemon=True);worker.start()
+    try: main()
+    finally: _STOP.set();worker.join(timeout=1)
