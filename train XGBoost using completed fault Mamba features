@@ -1,0 +1,127 @@
+# Colab: train XGBoost using completed fault Mamba features. No Mamba retraining.
+from pathlib import Path
+import json,time
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.metrics import (accuracy_score,precision_score,recall_score,f1_score,
+    confusion_matrix,ConfusionMatrixDisplay,roc_curve,roc_auc_score,
+    precision_recall_curve,average_precision_score,log_loss,brier_score_loss)
+try:
+    from xgboost import XGBClassifier
+except ImportError as exc:
+    raise ImportError('Run %pip install xgboost in a separate cell, then rerun.') from exc
+from google.colab import drive
+
+BASE=Path('/content/drive/MyDrive/Port Work')
+FEATURE_DIR=None  # Set Path('/content/drive/MyDrive/Port Work/YOUR_FOLDER/Features') if ambiguous.
+if not Path('/content/drive/MyDrive').is_dir(): drive.mount('/content/drive',force_remount=False)
+if FEATURE_DIR is None:
+    candidates=[BASE/name/'Features' for name in [
+        'Fault_Mamba_XGBoost_21_Engineered','Fault_Mamba_XGBoost_21_Engineered_Fast']]
+    complete=[p for p in candidates if all((p/f'{s}_mamba_features.npz').is_file() for s in ['train','validation','test'])]
+    if len(complete)!=1:
+        raise ValueError('Set FEATURE_DIR explicitly to the completed fault Features folder. Complete folders found: '+str(complete))
+    FEATURE_DIR=complete[0]
+FEATURE_DIR=Path(FEATURE_DIR)
+OUT=FEATURE_DIR.parent/'XGBoost_Fault_Standalone'
+OUT.mkdir(parents=True,exist_ok=True)
+print('Feature folder:',FEATURE_DIR,'\nOutput:',OUT,flush=True)
+EXPECTED={'train':[13860,6350],'validation':[1973,622],'test':[3947,1245]}
+D={};seen_ids=set();seen_eq=set();dim=None
+for split,counts in EXPECTED.items():
+    with np.load(FEATURE_DIR/f'{split}_mamba_features.npz',allow_pickle=False) as a:
+        X=a['H'].astype(np.float32);raw=a['y'];ids=a['window_id'].astype(str);eq=a['equipment_id'].astype(str)
+    if not np.isin(raw,[0,1]).all(): raise ValueError('Expected labels 0=Normal, 1=Faulty')
+    y=raw.astype(np.int64)
+    if np.bincount(y,minlength=2).tolist()!=counts: raise ValueError(f'{split}: unexpected class counts')
+    if X.ndim!=2 or len(X)!=len(y) or not np.isfinite(X).all(): raise ValueError('Invalid feature matrix')
+    if dim is None: dim=X.shape[1]
+    if X.shape[1]!=dim: raise ValueError('Feature dimensions differ')
+    if len(ids)!=len(y) or len(eq)!=len(y) or len(set(ids))!=len(ids): raise ValueError('Invalid identifiers')
+    if seen_ids&set(ids) or seen_eq&set(eq): raise ValueError('Window/equipment overlap across splits')
+    seen_ids.update(ids);seen_eq.update(eq)
+    meta=pd.DataFrame({'window_id':ids,'equipment_id':eq})
+    csv_path=FEATURE_DIR/f'{split}_mamba_features.csv'
+    if csv_path.is_file():
+        f=pd.read_csv(csv_path,dtype={'window_id':str,'equipment_id':str})
+        if f.window_id.duplicated().any() or set(f.window_id)!=set(ids): raise ValueError('CSV identifier mismatch')
+        f=f.set_index('window_id').loc[ids]
+        if not np.array_equal(f.equipment_id.to_numpy(),eq): raise ValueError('CSV equipment mismatch')
+        if 'label' in f and not np.array_equal(f.label.to_numpy(),y): raise ValueError('CSV label mismatch')
+        for col in ['window_start','window_end']:
+            if col in f: meta[col]=f[col].to_numpy()
+    D[split]={'X':X,'y':y,'meta':meta}
+    print(split,X.shape,'Normal/Faulty:',counts,flush=True)
+
+# Fixed small search. Training fits models; validation selects; test is not used.
+configs=[{'max_depth':3,'n_estimators':200,'reg_lambda':5.},
+         {'max_depth':4,'n_estimators':300,'reg_lambda':3.},
+         {'max_depth':6,'n_estimators':300,'reg_lambda':1.}]
+models=[];search=[];start=time.monotonic()
+for i,params in enumerate(configs):
+    print(f'\nTraining candidate {i+1}/{len(configs)}: {params}',flush=True)
+    model=XGBClassifier(objective='binary:logistic',eval_metric='logloss',tree_method='hist',
+        learning_rate=.05,subsample=.8,colsample_bytree=.8,min_child_weight=1,
+        n_jobs=2,random_state=42,**params)
+    model.fit(D['train']['X'],D['train']['y'],
+        eval_set=[(D['validation']['X'],D['validation']['y'])],verbose=25)
+    pv=model.predict_proba(D['validation']['X'])[:,1]
+    row={'candidate':i,**params,'validation_log_loss':float(log_loss(D['validation']['y'],pv)),
+         'validation_roc_auc':float(roc_auc_score(D['validation']['y'],pv)),
+         'validation_average_precision':float(average_precision_score(D['validation']['y'],pv))}
+    search.append(row);models.append(model);print(row,flush=True)
+selected=min(range(len(search)),key=lambda i:search[i]['validation_log_loss'])
+model=models[selected]
+pv=model.predict_proba(D['validation']['X'])[:,1]
+p,r,thresholds=precision_recall_curve(D['validation']['y'],pv)
+f1_values=2*p[:-1]*r[:-1]/np.maximum(p[:-1]+r[:-1],1e-12)
+threshold=float(thresholds[int(np.argmax(f1_values))])
+pd.DataFrame(search).to_csv(OUT/'validation_model_selection.csv',index=False)
+model.save_model(OUT/'fault_xgboost.json')
+(OUT/'configuration.json').write_text(json.dumps({'selected_candidate':search[selected],
+    'model_selection':'minimum validation log loss','threshold':threshold,
+    'threshold_selection':'maximum validation F1','input_dimension':dim,
+    'input_type':'learned Mamba embeddings; physical/engineered sensor names remain upstream',
+    'probabilities_calibrated':False,'data_origin':'synthetic'},indent=2))
+
+metrics={}
+for split,item in D.items():
+    prob=model.predict_proba(item['X'])[:,1]
+    pred=(prob>=threshold).astype(np.int64);y=item['y']
+    metrics[split]={'accuracy':float(accuracy_score(y,pred)),
+        'precision':float(precision_score(y,pred,zero_division=0)),
+        'recall':float(recall_score(y,pred,zero_division=0)),
+        'f1':float(f1_score(y,pred,zero_division=0)),
+        'roc_auc':float(roc_auc_score(y,prob)),
+        'average_precision':float(average_precision_score(y,prob)),
+        'log_loss':float(log_loss(y,prob)),
+        'brier_score':float(brier_score_loss(y,prob)),
+        'confusion_matrix':confusion_matrix(y,pred,labels=[0,1]).tolist()}
+    frame=item['meta'].copy();frame['split']=split;frame['true_label']=y
+    frame['fault_probability_estimate']=prob;frame['predicted_fault']=pred
+    frame['threshold']=threshold;frame['is_synthetic']=True
+    frame.to_csv(OUT/f'{split}_fault_predictions.csv',index=False)
+    if split=='test': test_y=y;test_prob=prob;test_pred=pred
+(OUT/'metrics.json').write_text(json.dumps(metrics,indent=2))
+print('\nTEST RESULTS — SYNTHETIC DATA',flush=True)
+print(json.dumps(metrics['test'],indent=2),flush=True)
+fig,axes=plt.subplots(1,3,figsize=(16,4.5))
+ConfusionMatrixDisplay.from_predictions(test_y,test_pred,labels=[0,1],display_labels=['Normal','Faulty'],
+    cmap='Blues',colorbar=False,values_format='d',ax=axes[0])
+axes[0].set_title('Fault test confusion matrix — N=5192')
+fpr,tpr,roc_thresholds=roc_curve(test_y,test_prob)
+axes[1].plot(fpr,tpr,label=f"AUC={metrics['test']['roc_auc']:.4f}")
+axes[1].plot([0,1],[0,1],'--',color='gray');axes[1].legend()
+axes[1].set(xlabel='False positive rate',ylabel='True positive rate',title='Test ROC')
+p,r,_=precision_recall_curve(test_y,test_prob)
+axes[2].plot(r,p,label=f"AP={metrics['test']['average_precision']:.4f}")
+axes[2].axhline(test_y.mean(),ls='--',color='gray',label='Prevalence');axes[2].legend()
+axes[2].set(xlabel='Recall',ylabel='Precision',title='Test precision–recall')
+fig.suptitle('Mamba features + XGBoost — synthetic data');fig.tight_layout()
+fig.savefig(OUT/'test_evaluation.png',dpi=200);plt.show();plt.close(fig)
+pd.DataFrame({'false_positive_rate':fpr,'true_positive_rate':tpr,'threshold':roc_thresholds}).to_csv(OUT/'test_roc_points.csv',index=False)
+pd.DataFrame({'mamba_feature':[f'Mamba_Feature_{i+1:03d}' for i in range(dim)],
+    'xgboost_gain_importance':model.feature_importances_}).sort_values('xgboost_gain_importance',ascending=False).to_csv(OUT/'mamba_embedding_importance.csv',index=False)
+print(f'Completed in {time.monotonic()-start:.1f}s. Saved to: {OUT}',flush=True)
+print('Probabilities are uncalibrated model estimates. Match genuine equipment/time windows before fusion; do not join independent synthetic cohorts by row order.')
